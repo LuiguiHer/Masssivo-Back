@@ -1,6 +1,6 @@
 # Masssivo Back (WhatsApp Cloud API)
 
-Servicio Node (Express + MongoDB + Socket.IO) para webhook de WhatsApp Cloud, portal Send (`/api/send`), e inbox (`/inbox`).
+Servicio Node (Express + MongoDB + Socket.IO) para webhook de WhatsApp Cloud, portal Send (`/api/send`) e inbox (`/inbox`).
 
 ## Requisitos
 
@@ -8,15 +8,29 @@ Servicio Node (Express + MongoDB + Socket.IO) para webhook de WhatsApp Cloud, po
 - MongoDB
 - Variables de entorno (copia `.env.example` a `.env`)
 
-## Arranque
+## Desarrollo y compilación
+
+Todo el código fuente está en `src/`. Compilar antes de arrancar en producción:
+
+```bash
+npm ci
+npm run build
+npm start
+```
+
+CLI de prueba (texto):
+
+```bash
+npx tsx src/cli/sendText.ts <E164_sin_+> "mensaje"
+```
+
+(definí `WA_ACCESS_TOKEN` y `WA_PHONE_NUMBER_ID` en `.env`)
+
+## Arranque (solo `dist/` ya generado)
 
 ```bash
 npm ci
 npm start
 ```
 
-Por defecto escucha el puerto definido en `dist/config.js` / entorno (suele ser `3000` detrás de nginx).
-
-## Repositorio
-
-Este árbol incluye `dist/` compilado listo para producción y `src/` parcialmente (varios módulos solo existen compilados en `dist/` hasta alinear todo el código fuente).
+Por defecto escucha el puerto de `PORT` o `3000` (`config`), detrás de nginx en producción.

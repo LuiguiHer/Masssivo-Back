@@ -5,16 +5,19 @@ declare const companyWebhookVerifyTokenSchema: mongoose.Schema<any, mongoose.Mod
     companyId: mongoose.Types.ObjectId;
     token: string;
     verifiedAt?: NativeDate | null | undefined;
+    liveTestPassedAt?: NativeDate | null | undefined;
 } & mongoose.DefaultTimestampProps, mongoose.Document<unknown, {}, mongoose.FlatRecord<{
     companyId: mongoose.Types.ObjectId;
     token: string;
     verifiedAt?: NativeDate | null | undefined;
+    liveTestPassedAt?: NativeDate | null | undefined;
 } & mongoose.DefaultTimestampProps>, {}, mongoose.MergeType<mongoose.DefaultSchemaOptions, {
     timestamps: true;
 }>> & mongoose.FlatRecord<{
     companyId: mongoose.Types.ObjectId;
     token: string;
     verifiedAt?: NativeDate | null | undefined;
+    liveTestPassedAt?: NativeDate | null | undefined;
 } & mongoose.DefaultTimestampProps> & {
     _id: mongoose.Types.ObjectId;
 } & {

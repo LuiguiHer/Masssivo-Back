@@ -37,6 +37,7 @@ export async function postSerwpSend(sendUrl, numberDigits, message) {
         await doPost(sendUrl);
     }
     catch (e) {
+        // HTTPS a un puerto que sirve HTTP plano: Node suele envolver el fallo en TypeError("fetch failed") + cause SSL.
         const combined = collectErrorText(e);
         const isSslMismatch = /ERR_SSL_PACKET_LENGTH_TOO_LONG|SSL routines|packet length too long/i.test(combined);
         if (isSslMismatch && /^https:\/\/127\.0\.0\.1(?::\d+)?\//.test(sendUrl)) {

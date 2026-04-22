@@ -1,3 +1,2 @@
-import { Router } from "express";
-export declare function createInboxRouter(jwtSecret: string): Router;
+export declare function createInboxRouter(jwtSecret: string): import("express-serve-static-core").Router;
 //# sourceMappingURL=inboxApi.d.ts.map

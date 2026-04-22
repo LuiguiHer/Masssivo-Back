@@ -20,7 +20,7 @@ const app = createApp({
     onWebhookVerifySuccess: async (token) => {
         const tokenTrim = token.trim();
         const now = new Date();
-        const hit = await CompanyWebhookVerifyToken.findOneAndUpdate({ token: tokenTrim }, { $set: { verifiedAt: now } }, { new: true }).lean();
+        const hit = (await CompanyWebhookVerifyToken.findOneAndUpdate({ token: tokenTrim }, { $set: { verifiedAt: now } }, { new: true }).lean());
         if (hit?.companyId) {
             io?.to(`company:${String(hit.companyId)}`).emit("webhook:status", {
                 connected: true,
@@ -46,9 +46,12 @@ io.use((socket, next) => {
         if (!token)
             return next(new Error("unauthorized"));
         const payload = jwt.verify(token, config.sendJwtSecret);
-        if (!payload.sub || !payload.companyId)
+        if (typeof payload === "string" || !payload.sub)
             return next(new Error("unauthorized"));
-        socket.join(`company:${payload.companyId}`);
+        const companyId = "companyId" in payload ? payload.companyId : undefined;
+        if (!companyId)
+            return next(new Error("unauthorized"));
+        socket.join(`company:${String(companyId)}`);
         return next();
     }
     catch {

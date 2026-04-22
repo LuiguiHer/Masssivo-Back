@@ -1,9 +1,4 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.canonicalWaId = canonicalWaId;
-exports.waIdAliases = waIdAliases;
-exports.waIdGroupKey = waIdGroupKey;
-function canonicalWaId(input) {
+export function canonicalWaId(input) {
     const digits = String(input ?? "").replace(/\D/g, "");
     if (!digits)
         return "";
@@ -15,7 +10,7 @@ function canonicalWaId(input) {
     }
     return noIntl00;
 }
-function waIdAliases(input) {
+export function waIdAliases(input) {
     const base = canonicalWaId(input);
     if (!base)
         return [];
@@ -36,7 +31,7 @@ function waIdAliases(input) {
     }
     return [...set];
 }
-function waIdGroupKey(input) {
+export function waIdGroupKey(input) {
     const base = canonicalWaId(input);
     if (!base)
         return "";
@@ -45,3 +40,4 @@ function waIdGroupKey(input) {
         return base.slice(2);
     return base;
 }
+//# sourceMappingURL=waId.js.map

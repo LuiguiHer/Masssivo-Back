@@ -1556,7 +1556,9 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     }
     let mergedRowResults = rowResults;
     if (rowResults !== undefined) {
-      const existingDoc = await MassCampaign.findOne({ _id: id, companyId: req.auth.companyId }).lean();
+      const existingDoc = (await MassCampaign.findOne({ _id: id, companyId: req.auth.companyId }).lean()) as {
+        rowResults?: Record<string, unknown>[];
+      } | null;
       if (!existingDoc) return res.status(404).json({ error: "Campaña no encontrada" });
       mergedRowResults = mergeIncomingRowResultsWithExisting(
         existingDoc.rowResults as Record<string, unknown>[] | undefined,

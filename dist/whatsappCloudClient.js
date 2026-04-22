@@ -46,8 +46,7 @@ export class WhatsAppCloudClient {
     }
     async request(method, path, opts) {
         const q = opts?.query
-            ? "?" +
-                new URLSearchParams(Object.entries(opts.query).filter(([, v]) => v != null)).toString()
+            ? `?${new URLSearchParams(Object.entries(opts.query).filter(([, v]) => v != null)).toString()}`
             : "";
         const url = `${this.base}${path}${q}`;
         const json = opts?.json !== false;
@@ -58,8 +57,9 @@ export class WhatsAppCloudClient {
         const res = await fetch(url, init);
         const data = await this.parseJson(res);
         if (!res.ok) {
+            const errObj = data;
             const msg = typeof data === "object" && data && "error" in data
-                ? String(data.error?.message ?? res.statusText)
+                ? String(errObj.error?.message ?? res.statusText)
                 : res.statusText;
             throw new WhatsAppCloudError(msg, res.status, data);
         }
@@ -140,7 +140,7 @@ export class WhatsAppCloudClient {
     }
     /** Descarga binarios usando la URL temporal (válida ~5 min) + Bearer */
     async downloadMedia(mediaId) {
-        const meta = await this.getMediaMetadata(mediaId);
+        const meta = (await this.getMediaMetadata(mediaId));
         if (!meta.url)
             throw new Error("La API no devolvió url para el media");
         const res = await fetch(meta.url, { headers: { Authorization: `Bearer ${this.accessToken}` } });
@@ -155,16 +155,15 @@ export class WhatsAppCloudClient {
     async uploadMediaFile(file, filename, mimeType) {
         const fd = new FormData();
         fd.set("messaging_product", "whatsapp");
-        const blob = Buffer.isBuffer(file)
-            ? new Blob([new Uint8Array(file)], { type: mimeType })
-            : file;
+        const blob = Buffer.isBuffer(file) ? new Blob([new Uint8Array(file)], { type: mimeType }) : file;
         fd.set("file", blob, filename);
         const url = `${this.base}/${this.phoneNumberId}/media`;
         const res = await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${this.accessToken}` }, body: fd });
         const data = await this.parseJson(res);
         if (!res.ok) {
+            const errObj = data;
             const msg = typeof data === "object" && data && "error" in data
-                ? String(data.error?.message ?? res.statusText)
+                ? String(errObj.error?.message ?? res.statusText)
                 : res.statusText;
             throw new WhatsAppCloudError(msg, res.status, data);
         }

@@ -15,10 +15,61 @@ import { User } from "../models/User.js";
 import { UploadedMedia } from "../models/UploadedMedia.js";
 import { TemplateSampleUpload } from "../models/TemplateSampleUpload.js";
 import { generateNumericOtp6, hashOtpCode, normalizeDigits, postSerwpSend } from "../services/serwpSend.js";
-import { computeDeliveryStatsFromRows, mergeIncomingRowResultsWithExisting } from "../services/massCampaignDelivery.js";
+import { computeDeliveryStatsFromRows, mergeIncomingRowResultsWithExisting, } from "../services/massCampaignDelivery.js";
 import { canonicalWaId } from "../services/waId.js";
 import { cancelLiveTest, startLiveTest } from "../services/webhookTestSession.js";
 import { requireAuth } from "../middleware/requireAuth.js";
+/** ID de app Meta para uploads resumibles; opcional por empresa o META_APP_ID en entorno. */
+function resolveMetaAppId(cfg) {
+    const fromCfg = String(cfg.waMetaAppId ?? "").trim();
+    if (fromCfg)
+        return fromCfg;
+    return String(process.env.META_APP_ID ?? process.env.WHATSAPP_META_APP_ID ?? "").trim();
+}
+/** Tipos MIME admitidos por Graph Resumable Upload para plantillas (Meta). */
+function metaResumableFileType(mimetype, originalname) {
+    const m = (mimetype || "").toLowerCase();
+    const ext = (originalname.includes(".") ? originalname.split(".").pop() ?? "" : "").toLowerCase();
+    if (m === "image/jpeg" || m === "image/jpg" || ext === "jpg" || ext === "jpeg")
+        return "image/jpeg";
+    if (m === "image/png" || ext === "png")
+        return "image/png";
+    if (m === "video/mp4" || ext === "mp4")
+        return "video/mp4";
+    if (m === "application/pdf" || ext === "pdf")
+        return "application/pdf";
+    return null;
+}
+function buildInboxTemplateDisplay(components, footerText) {
+    const out = {};
+    const ft = footerText.trim();
+    if (ft)
+        out.footerText = ft;
+    if (Array.isArray(components)) {
+        for (const c of components) {
+            if (!c || typeof c !== "object")
+                continue;
+            const comp = c;
+            if (String(comp.type ?? "").toLowerCase() !== "header")
+                continue;
+            const params = Array.isArray(comp.parameters) ? comp.parameters : [];
+            for (const p of params) {
+                if (!p || typeof p !== "object")
+                    continue;
+                const param = p;
+                if (param.type === "image" && param.image && typeof param.image === "object") {
+                    const link = typeof param.image.link === "string" ? param.image.link.trim() : "";
+                    const id = typeof param.image.id === "string" ? param.image.id.trim() : "";
+                    if (link)
+                        out.headerImageUrl = link;
+                    if (id)
+                        out.headerImageMediaId = id;
+                }
+            }
+        }
+    }
+    return Object.keys(out).length ? out : undefined;
+}
 async function getCompanyWhatsappConfigByAuthUser(userId) {
     const u = await User.findById(userId).lean();
     if (!u)
@@ -45,25 +96,6 @@ async function fetchMetaTemplateById(cfg, templateId) {
     if (!rMeta.ok)
         return { ok: false, status: rMeta.status, data };
     return { ok: true, data };
-}
-function resolveMetaAppId(cfg) {
-    const fromCfg = String(cfg.waMetaAppId ?? "").trim();
-    if (fromCfg)
-        return fromCfg;
-    return String(process.env.META_APP_ID ?? process.env.WHATSAPP_META_APP_ID ?? "").trim();
-}
-function metaResumableFileType(mimetype, originalname) {
-    const m = (mimetype || "").toLowerCase();
-    const ext = (originalname.includes(".") ? originalname.split(".").pop() ?? "" : "").toLowerCase();
-    if (m === "image/jpeg" || m === "image/jpg" || ext === "jpg" || ext === "jpeg")
-        return "image/jpeg";
-    if (m === "image/png" || ext === "png")
-        return "image/png";
-    if (m === "video/mp4" || ext === "mp4")
-        return "video/mp4";
-    if (m === "application/pdf" || ext === "pdf")
-        return "application/pdf";
-    return null;
 }
 function signToken(deps, userId, companyId) {
     return jwt.sign(companyId ? { companyId } : {}, deps.jwtSecret, { subject: userId, expiresIn: "7d" });
@@ -105,6 +137,7 @@ async function verifyOtp(purpose, whatsappDigits, code) {
     await challenge.save();
     return { ok: true, challenge };
 }
+/** Base pública `https://host/api/send` para URLs de muestra (variable PUBLIC_TEMPLATE_SAMPLE_BASE_URL opcional). */
 function inferPublicSendApiBase(req) {
     const fixed = process.env.PUBLIC_TEMPLATE_SAMPLE_BASE_URL?.trim().replace(/\/$/, "");
     if (fixed)
@@ -121,6 +154,7 @@ export function createSendApiRouter(deps) {
     const r = Router();
     const auth = requireAuth(deps.jwtSecret);
     const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+    /** Sin auth: Meta y otros clientes deben poder GET por HTTPS el archivo de muestra. */
     r.get("/public/template-sample/:token", async (req, res) => {
         const token = String(req.params.token ?? "").trim();
         if (!token)
@@ -132,6 +166,7 @@ export function createSendApiRouter(deps) {
         res.setHeader("Cache-Control", "public, max-age=86400");
         return res.send(Buffer.from(doc.data));
     });
+    /** Sube la muestra a MongoDB y devuelve una URL HTTPS pública para `header_handle` (evita fallos de la API resumible de Meta). */
     r.post("/media/template-sample-hosted", auth, upload.single("file"), async (req, res) => {
         if (!req.auth)
             return res.status(401).json({ error: "No autenticado" });
@@ -592,15 +627,18 @@ export function createSendApiRouter(deps) {
         }
         if (!rMeta.ok)
             return res.status(rMeta.status).json({ error: "Meta templates query failed", detail: data });
-        const rows = Array.isArray(data?.data) ? data.data ?? [] : [];
+        const rows = Array.isArray(data?.data) ? (data.data ?? []) : [];
         const options = rows
-            .map((o) => ({
-            id: String(o.id ?? "").trim(),
-            name: String(o.name ?? "").trim(),
-            languageCode: String(o.language ?? "").trim(),
-            status: String(o.status ?? "").trim(),
-            category: String(o.category ?? "").trim(),
-        }))
+            .map((x) => {
+            const o = x;
+            return {
+                id: String(o.id ?? "").trim(),
+                name: String(o.name ?? "").trim(),
+                languageCode: String(o.language ?? "").trim(),
+                status: String(o.status ?? "").trim(),
+                category: String(o.category ?? "").trim(),
+            };
+        })
             .filter((x) => x.id && x.name && x.languageCode)
             .filter((x) => x.status.toUpperCase() === "APPROVED");
         return res.json({ data: options });
@@ -614,7 +652,7 @@ export function createSendApiRouter(deps) {
             return res.status(err.code).json({ error: err.message });
         }
         const { cfg } = got;
-        const saved = cfg.messageStartTemplate ?? {};
+        const saved = (cfg.messageStartTemplate ?? {});
         const out = {
             templateLabel: String(saved.templateLabel ?? "inicio_conversacion"),
             metaTemplateId: String(saved.metaTemplateId ?? ""),
@@ -740,6 +778,15 @@ export function createSendApiRouter(deps) {
         if (typeof b.parameter_format === "string" && b.parameter_format.trim()) {
             payload.parameter_format = String(b.parameter_format).trim().toUpperCase();
         }
+        if (typeof b.sub_category === "string" && b.sub_category.trim()) {
+            payload.sub_category = String(b.sub_category).trim().toUpperCase();
+        }
+        if (typeof b.message_send_ttl_seconds === "number" && Number.isFinite(b.message_send_ttl_seconds)) {
+            payload.message_send_ttl_seconds = b.message_send_ttl_seconds;
+        }
+        if (typeof b.allow_template_category_change === "boolean") {
+            payload.allow_template_category_change = b.allow_template_category_change;
+        }
         const url = `https://graph.facebook.com/${encodeURIComponent(cfg.graphApiVersion)}/${encodeURIComponent(cfg.waWabaId)}/message_templates`;
         const rMeta = await fetch(url, {
             method: "POST",
@@ -783,6 +830,12 @@ export function createSendApiRouter(deps) {
             patch.language = String(b.language).trim();
         if (typeof b.name === "string" && b.name.trim())
             patch.name = String(b.name).trim().toLowerCase().replace(/\s+/g, "_");
+        if (typeof b.parameter_format === "string" && b.parameter_format.trim()) {
+            patch.parameter_format = String(b.parameter_format).trim().toUpperCase();
+        }
+        if (typeof b.sub_category === "string" && b.sub_category.trim()) {
+            patch.sub_category = String(b.sub_category).trim().toUpperCase();
+        }
         if (Object.keys(patch).length === 0)
             return res.status(400).json({ error: "Envía al menos components, category, language o name para editar" });
         const url = `https://graph.facebook.com/${encodeURIComponent(cfg.graphApiVersion)}/${encodeURIComponent(templateId)}`;
@@ -857,10 +910,11 @@ export function createSendApiRouter(deps) {
         const languageCode = String(b.languageCode ?? "").trim();
         const components = Array.isArray(b.components) ? b.components : undefined;
         const previewText = String(b.previewText ?? "").trim();
+        const footerText = String(b.footerText ?? "").trim();
         if (!to || !name || !languageCode) {
             return res.status(400).json({ error: "to, templateName y languageCode son obligatorios" });
         }
-        const payload = {
+        const graphPayload = {
             messaging_product: "whatsapp",
             to,
             type: "template",
@@ -870,6 +924,11 @@ export function createSendApiRouter(deps) {
                 ...(components ? { components } : {}),
             },
         };
+        const inboxTemplateDisplay = buildInboxTemplateDisplay(components, footerText);
+        const storedPayload = {
+            ...graphPayload,
+            ...(inboxTemplateDisplay ? { inboxTemplateDisplay } : {}),
+        };
         const url = `https://graph.facebook.com/${encodeURIComponent(cfg.graphApiVersion)}/${encodeURIComponent(cfg.waPhoneNumberId)}/messages`;
         const rMeta = await fetch(url, {
             method: "POST",
@@ -877,7 +936,7 @@ export function createSendApiRouter(deps) {
                 Authorization: `Bearer ${cfg.waAccessToken}`,
                 "Content-Type": "application/json",
             },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(graphPayload),
         });
         const text = await rMeta.text();
         let data = null;
@@ -889,38 +948,38 @@ export function createSendApiRouter(deps) {
         }
         if (!rMeta.ok)
             return res.status(rMeta.status).json({ error: "Meta send template failed", detail: data });
-    const u = await User.findById(req.auth.userId).lean();
-    if (!u?.companyId)
-        return res.status(400).json({ error: "Debes crear empresa primero" });
-    const wamid = typeof data === "object" && data && Array.isArray(data.messages)
-        ? data.messages?.[0]?.id
-        : void 0;
-    const now = /* @__PURE__ */ new Date();
-    const bodyPreview = previewText ||
-        (`Plantilla: ${name} (${languageCode})` +
-            (Array.isArray(components) && components.length ? " · con variables" : ""));
-    if (wamid) {
-        await Message.findOneAndUpdate({ companyId: u.companyId, wamid }, {
-            $setOnInsert: {
-                companyId: u.companyId,
-                waId: to,
-                wamid,
-                direction: "out",
-                type: "template",
-                bodyText: bodyPreview,
-                payload,
-                timestamp: now
-            }
+        const u = await User.findById(req.auth.userId).lean();
+        if (!u?.companyId)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const wamid = typeof data === "object" && data && Array.isArray(data.messages)
+            ? data.messages?.[0]?.id
+            : undefined;
+        const now = new Date();
+        const bodyPreview = previewText ||
+            (`Plantilla: ${name} (${languageCode})` +
+                (Array.isArray(components) && components.length ? " · con variables" : ""));
+        if (wamid) {
+            await Message.findOneAndUpdate({ companyId: u.companyId, wamid }, {
+                $setOnInsert: {
+                    companyId: u.companyId,
+                    waId: to,
+                    wamid,
+                    direction: "out",
+                    type: "template",
+                    bodyText: bodyPreview,
+                    payload: storedPayload,
+                    timestamp: now,
+                },
+            }, { upsert: true });
+        }
+        await Chat.findOneAndUpdate({ companyId: u.companyId, waId: to }, {
+            $set: {
+                lastMessageAt: now,
+                lastMessagePreview: bodyPreview,
+            },
+            $setOnInsert: { companyId: u.companyId, waId: to },
         }, { upsert: true });
-    }
-    await Chat.findOneAndUpdate({ companyId: u.companyId, waId: to }, {
-        $set: {
-            lastMessageAt: now,
-            lastMessagePreview: bodyPreview
-        },
-        $setOnInsert: { companyId: u.companyId, waId: to }
-    }, { upsert: true });
-    console.info("[whatsapp/graph] send template ok", JSON.stringify({ companyId: String(u.companyId), to, wamid: wamid ?? null, templateName: name, languageCode, metaResponse: data }, null, 0));
+        console.info("[whatsapp/graph] send template ok", JSON.stringify({ companyId: String(u.companyId), to, wamid: wamid ?? null, templateName: name, languageCode, metaResponse: data }, null, 0));
         return res.json(data);
     });
     r.post("/messages/text", auth, async (req, res) => {
@@ -1093,142 +1152,147 @@ export function createSendApiRouter(deps) {
         console.info("[whatsapp/graph] send image ok", JSON.stringify({ companyId: String(u.companyId), to, wamid: wamid ?? null, mediaId, metaResponse: data }, null, 0));
         return res.json(data);
     });
-  r.post("/media/upload", auth, upload.single("file"), async (req, res) => {
-    if (!req.auth)
-      return res.status(401).json({ error: "No autenticado" });
-    const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
-    if ("error" in got) {
-      const err = got.error ?? { code: 500, message: "Error interno" };
-      return res.status(err.code).json({ error: err.message });
-    }
-    const { cfg } = got;
-    const u = await User.findById(req.auth.userId).lean();
-    if (!u?.companyId)
-      return res.status(400).json({ error: "Debes crear empresa primero" });
-    const file = req.file;
-    const label = String(req.body?.label ?? "").trim();
-    if (!file)
-      return res.status(400).json({ error: "file es obligatorio" });
-    const form = new FormData();
-    form.append("messaging_product", "whatsapp");
-    form.append("type", file.mimetype || "image/jpeg");
-    form.append(
-      "file",
-      new Blob([new Uint8Array(file.buffer)], { type: file.mimetype || "application/octet-stream" }),
-      file.originalname || "upload.bin"
-    );
-    const uploadUrl = `https://graph.facebook.com/${encodeURIComponent(cfg.graphApiVersion)}/${encodeURIComponent(cfg.waPhoneNumberId)}/media`;
-    const uploadResp = await fetch(uploadUrl, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${cfg.waAccessToken}` },
-      body: form
+    r.post("/media/upload", auth, upload.single("file"), async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
+        if ("error" in got) {
+            const err = got.error ?? { code: 500, message: "Error interno" };
+            return res.status(err.code).json({ error: err.message });
+        }
+        const { cfg } = got;
+        const u = await User.findById(req.auth.userId).lean();
+        if (!u?.companyId)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const file = req.file;
+        const label = String(req.body?.label ?? "").trim();
+        if (!file)
+            return res.status(400).json({ error: "file es obligatorio" });
+        const form = new FormData();
+        form.append("messaging_product", "whatsapp");
+        form.append("type", file.mimetype || "image/jpeg");
+        form.append("file", new Blob([new Uint8Array(file.buffer)], { type: file.mimetype || "application/octet-stream" }), file.originalname || "upload.bin");
+        const uploadUrl = `https://graph.facebook.com/${encodeURIComponent(cfg.graphApiVersion)}/${encodeURIComponent(cfg.waPhoneNumberId)}/media`;
+        const uploadResp = await fetch(uploadUrl, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${cfg.waAccessToken}` },
+            body: form,
+        });
+        const raw = await uploadResp.text();
+        let data = null;
+        try {
+            data = raw ? JSON.parse(raw) : null;
+        }
+        catch {
+            data = { raw };
+        }
+        if (!uploadResp.ok)
+            return res.status(uploadResp.status).json({ error: "Meta media upload failed", detail: data });
+        const mediaId = typeof data === "object" && data && "id" in data ? String(data.id ?? "") : "";
+        if (mediaId) {
+            await UploadedMedia.create({
+                companyId: u.companyId,
+                mediaId,
+                label: label || undefined,
+                mimeType: file.mimetype || "",
+                originalName: file.originalname || "",
+            });
+        }
+        return res.json(data);
     });
-    const raw = await uploadResp.text();
-    let data = null;
-    try {
-      data = raw ? JSON.parse(raw) : null;
-    } catch {
-      data = { raw };
-    }
-    if (!uploadResp.ok)
-      return res.status(uploadResp.status).json({ error: "Meta media upload failed", detail: data });
-    const mediaId = typeof data === "object" && data && "id" in data ? String(data.id ?? "") : "";
-    if (mediaId) {
-      await UploadedMedia.create({
-        companyId: u.companyId,
-        mediaId,
-        label: label || void 0,
-        mimeType: file.mimetype || "",
-        originalName: file.originalname || ""
-      });
-    }
-    return res.json(data);
-  });
-  r.post("/media/template-resumable", auth, upload.single("file"), async (req, res) => {
-    if (!req.auth)
-      return res.status(401).json({ error: "No autenticado" });
-    const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
-    if ("error" in got) {
-      const err = got.error ?? { code: 500, message: "Error interno" };
-      return res.status(err.code).json({ error: err.message });
-    }
-    const { cfg } = got;
-    const file = req.file;
-    if (!file)
-      return res.status(400).json({ error: "file es obligatorio (multipart campo file)" });
-    const appId = resolveMetaAppId(cfg);
-    if (!appId) {
-      return res.status(400).json({
-        error:
-          "Meta no acepta el media id del número para la muestra de plantilla. Configura el ID numérico de tu app (developers.facebook.com → tu app → Configuración → Básico) en WhatsApp Cloud del panel, o la variable META_APP_ID en el servidor; luego vuelve a subir la imagen para obtener un identificador válido.",
-      });
-    }
-    const fileType = metaResumableFileType(file.mimetype || "", file.originalname || "");
-    if (!fileType) {
-      return res.status(400).json({
-        error:
-          "Formato no admitido para muestra de plantilla. Usa JPG, JPEG, PNG, MP4 o PDF según Meta (Graph Resumable Upload).",
-      });
-    }
-    const v = encodeURIComponent(cfg.graphApiVersion);
-    const token = cfg.waAccessToken;
-    const fileName = file.originalname || "sample.bin";
-    const startParams = new URLSearchParams({
-      file_name: fileName,
-      file_length: String(file.size),
-      file_type: fileType,
-      access_token: token,
+    /**
+     * Muestra para plantillas (HEADER IMAGE/VIDEO/DOCUMENT): solo Graph Resumible (`/{APP_ID}/uploads` → `h`).
+     * El media id de `/{phone}/media` (Masividad) no es válido en header_handle al crear plantillas (Meta 131009 / 2494102).
+     */
+    r.post("/media/template-resumable", auth, upload.single("file"), async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
+        if ("error" in got) {
+            const err = got.error ?? { code: 500, message: "Error interno" };
+            return res.status(err.code).json({ error: err.message });
+        }
+        const { cfg } = got;
+        const file = req.file;
+        if (!file)
+            return res.status(400).json({ error: "file es obligatorio (multipart campo file)" });
+        const appId = resolveMetaAppId(cfg);
+        if (!appId) {
+            return res.status(400).json({
+                error: "Meta no acepta el media id del número para la muestra de plantilla. Configura el ID numérico de tu app (developers.facebook.com → tu app → Configuración → Básico) en WhatsApp Cloud del panel, o la variable META_APP_ID en el servidor; luego vuelve a subir la imagen para obtener un identificador válido.",
+            });
+        }
+        const fileType = metaResumableFileType(file.mimetype || "", file.originalname || "");
+        if (!fileType) {
+            return res.status(400).json({
+                error: "Formato no admitido para muestra de plantilla. Usa JPG, JPEG, PNG, MP4 o PDF según Meta (Graph Resumable Upload).",
+            });
+        }
+        const v = encodeURIComponent(cfg.graphApiVersion);
+        const token = cfg.waAccessToken;
+        const fileName = file.originalname || "sample.bin";
+        const startParams = new URLSearchParams({
+            file_name: fileName,
+            file_length: String(file.size),
+            file_type: fileType,
+            access_token: token,
+        });
+        const startUrl = `https://graph.facebook.com/${v}/${encodeURIComponent(appId)}/uploads?${startParams.toString()}`;
+        const startResp = await fetch(startUrl, { method: "POST" });
+        const startText = await startResp.text();
+        let startData = null;
+        try {
+            startData = startText ? JSON.parse(startText) : null;
+        }
+        catch {
+            startData = { raw: startText };
+        }
+        if (!startResp.ok) {
+            return res.status(startResp.status).json({ error: "Meta no pudo iniciar la subida resumible", detail: startData });
+        }
+        const sessionId = typeof startData === "object" && startData && "id" in startData
+            ? String(startData.id ?? "")
+            : "";
+        if (!sessionId)
+            return res.status(502).json({ error: "Meta no devolvió id de sesión de subida", detail: startData });
+        // Importante: el id suele ser `upload:…` con dos puntos literales; NO usar encodeURIComponent
+        // sobre el id completo (convierte `:` en %3A y Meta responde "Object does not exist").
+        const graphUploadUrl = `https://graph.facebook.com/${cfg.graphApiVersion}/${sessionId}`;
+        const uploadUrlObj = new URL(graphUploadUrl);
+        uploadUrlObj.searchParams.set("access_token", token);
+        const uploadResp = await fetch(uploadUrlObj.toString(), {
+            method: "POST",
+            headers: {
+                Authorization: `OAuth ${token}`,
+                file_offset: "0",
+                "Content-Type": "application/octet-stream",
+            },
+            body: Buffer.from(file.buffer),
+        });
+        const uploadText = await uploadResp.text();
+        let uploadData = null;
+        try {
+            uploadData = uploadText ? JSON.parse(uploadText) : null;
+        }
+        catch {
+            uploadData = { raw: uploadText };
+        }
+        if (!uploadResp.ok) {
+            return res.status(uploadResp.status).json({ error: "Meta no pudo completar la subida de muestra", detail: uploadData });
+        }
+        const handle = typeof uploadData === "object" && uploadData && "h" in uploadData
+            ? String(uploadData.h ?? "")
+            : "";
+        if (!handle)
+            return res.status(502).json({ error: "Meta no devolvió el handle de muestra (campo h)", detail: uploadData });
+        return res.json({ handle });
     });
-    const startUrl = `https://graph.facebook.com/${v}/${encodeURIComponent(appId)}/uploads?${startParams.toString()}`;
-    const startResp = await fetch(startUrl, { method: "POST" });
-    const startText = await startResp.text();
-    let startData = null;
-    try {
-      startData = startText ? JSON.parse(startText) : null;
-    } catch {
-      startData = { raw: startText };
-    }
-    if (!startResp.ok) {
-      return res.status(startResp.status).json({ error: "Meta no pudo iniciar la subida resumible", detail: startData });
-    }
-    const sessionId =
-      typeof startData === "object" && startData && "id" in startData ? String(startData.id ?? "") : "";
-    if (!sessionId)
-      return res.status(502).json({ error: "Meta no devolvió id de sesión de subida", detail: startData });
-    const graphUploadUrl = `https://graph.facebook.com/${cfg.graphApiVersion}/${sessionId}`;
-    const uploadUrlObj = new URL(graphUploadUrl);
-    uploadUrlObj.searchParams.set("access_token", token);
-    const uploadResp = await fetch(uploadUrlObj.toString(), {
-      method: "POST",
-      headers: {
-        Authorization: `OAuth ${token}`,
-        file_offset: "0",
-        "Content-Type": "application/octet-stream",
-      },
-      body: Buffer.from(file.buffer),
+    r.get("/media/uploads", auth, async (req, res) => {
+        if (!req.auth?.companyId)
+            return res.status(403).json({ error: "Debes configurar tu empresa primero" });
+        const rows = await UploadedMedia.find({ companyId: req.auth.companyId }).sort({ createdAt: -1 }).limit(100).lean();
+        return res.json(rows);
     });
-    const uploadText = await uploadResp.text();
-    let uploadData = null;
-    try {
-      uploadData = uploadText ? JSON.parse(uploadText) : null;
-    } catch {
-      uploadData = { raw: uploadText };
-    }
-    if (!uploadResp.ok) {
-      return res.status(uploadResp.status).json({ error: "Meta no pudo completar la subida de muestra", detail: uploadData });
-    }
-    const handle =
-      typeof uploadData === "object" && uploadData && "h" in uploadData ? String(uploadData.h ?? "") : "";
-    if (!handle)
-      return res.status(502).json({ error: "Meta no devolvió el handle de muestra (campo h)", detail: uploadData });
-    return res.json({ handle });
-  });
-  r.get("/media/uploads", auth, async (req, res) => {
-    if (!req.auth?.companyId)
-      return res.status(403).json({ error: "Debes configurar tu empresa primero" });
-    const rows = await UploadedMedia.find({ companyId: req.auth.companyId }).sort({ createdAt: -1 }).limit(100).lean();
-    return res.json(rows);
-  });
     r.get("/media/:mediaId", auth, async (req, res) => {
         if (!req.auth)
             return res.status(401).json({ error: "No autenticado" });
@@ -1337,137 +1401,146 @@ export function createSendApiRouter(deps) {
             return res.status(404).json({ error: "Cliente no encontrado" });
         return res.json({ ok: true });
     });
-  r.post("/massivity/campaigns", auth, async (req, res) => {
-    if (!req.auth?.companyId)
-      return res.status(403).json({ error: "Debes configurar tu empresa primero" });
-    const b = req.body ?? {};
-    const name = String(b.name ?? "").trim();
-    const fileName = String(b.fileName ?? "").trim();
-    const phoneColumn = String(b.phoneColumn ?? "").trim();
-    const templateName = String(b.templateName ?? "").trim();
-    const languageCode = String(b.languageCode ?? "").trim();
-    const intervalSec = Math.max(1, Number(b.intervalSec) || 1);
-    const rowCount = Math.max(0, Number(b.rowCount) || 0);
-    const variableMapping = b.variableMapping ?? {};
-    const headerImageModeRaw = String(b.headerImageMode ?? "").trim();
-    const headerImageMode = headerImageModeRaw === "url" || headerImageModeRaw === "mediaId" ? headerImageModeRaw : void 0;
-    const headerImageUrl = String(b.headerImageUrl ?? "").trim();
-    const headerImageMediaId = String(b.headerImageMediaId ?? "").trim();
-    if (!name || !phoneColumn || !templateName || !languageCode) {
-      return res.status(400).json({ error: "name, phoneColumn, templateName y languageCode son obligatorios" });
-    }
-    const doc = await MassCampaign.create({
-      companyId: req.auth.companyId,
-      name,
-      fileName,
-      phoneColumn,
-      templateName,
-      languageCode,
-      variableMapping,
-      headerImageMode,
-      headerImageUrl: headerImageUrl || void 0,
-      headerImageMediaId: headerImageMediaId || void 0,
-      intervalSec,
-      rowCount,
-      status: "draft"
-    });
-    return res.status(201).json(doc);
-  });
-  r.get("/massivity/campaigns", auth, async (req, res) => {
-    if (!req.auth?.companyId)
-      return res.status(403).json({ error: "Debes configurar tu empresa primero" });
-    const rows = await MassCampaign.find({ companyId: req.auth.companyId }).sort({ createdAt: -1 }).limit(30).select("-rowResults").lean();
-    return res.json(rows);
-  });
-  r.get("/massivity/campaigns/:id", auth, async (req, res) => {
-    if (!req.auth?.companyId)
-      return res.status(403).json({ error: "Debes configurar tu empresa primero" });
-    const id = String(req.params.id ?? "");
-    if (!isValidObjectId(id))
-      return res.status(400).json({ error: "ID inválido" });
-    const doc = await MassCampaign.findOne({ _id: id, companyId: req.auth.companyId }).lean();
-    if (!doc)
-      return res.status(404).json({ error: "Campaña no encontrada" });
-    return res.json(doc);
-  });
-  r.patch("/massivity/campaigns/:id/status", auth, async (req, res) => {
-    if (!req.auth?.companyId)
-      return res.status(403).json({ error: "Debes configurar tu empresa primero" });
-    const id = String(req.params.id ?? "");
-    if (!isValidObjectId(id))
-      return res.status(400).json({ error: "ID inválido" });
-    const status = String(req.body?.status ?? "").trim();
-    if (!["draft", "sent"].includes(status))
-      return res.status(400).json({ error: "status inválido" });
-    const sentCountBody = Math.max(0, Number(req.body?.sentCount) || 0);
-    const failCountBody = Math.max(0, Number(req.body?.failCount) || 0);
-    const rawRowResults = req.body?.rowResults;
-    let rowResults = void 0;
-    if (Array.isArray(rawRowResults)) {
-      const normalized = [];
-      for (const item of rawRowResults) {
-        if (!item || typeof item !== "object")
-          continue;
-        const o = item;
-        const rowIndex = Math.floor(Number(o.rowIndex));
-        if (!Number.isFinite(rowIndex) || rowIndex < 1)
-          continue;
-        const phone = String(o.phone ?? "").replace(/\D/g, "").slice(0, 24);
-        const wamid = String(o.wamid ?? "").trim().slice(0, 160);
-        const deliveryStatus = String(o.deliveryStatus ?? "").trim().slice(0, 64);
-        const reason = String(o.reason ?? "").trim().slice(0, 500);
-        const row = { rowIndex, phone };
-        if (wamid)
-          row.wamid = wamid;
-        if (typeof o.apiOk === "boolean")
-          row.apiOk = o.apiOk;
-        if (deliveryStatus)
-          row.deliveryStatus = deliveryStatus;
-        if (typeof o.ok === "boolean")
-          row.ok = o.ok;
-        if (reason)
-          row.reason = reason;
-        const dua = o.deliveryUpdatedAt;
-        if (dua) {
-          const d = new Date(String(dua));
-          if (!Number.isNaN(d.getTime()))
-            row.deliveryUpdatedAt = d;
+    r.post("/massivity/campaigns", auth, async (req, res) => {
+        if (!req.auth?.companyId)
+            return res.status(403).json({ error: "Debes configurar tu empresa primero" });
+        const b = req.body ?? {};
+        const name = String(b.name ?? "").trim();
+        const fileName = String(b.fileName ?? "").trim();
+        const phoneColumn = String(b.phoneColumn ?? "").trim();
+        const templateName = String(b.templateName ?? "").trim();
+        const languageCode = String(b.languageCode ?? "").trim();
+        const intervalSec = Math.max(1, Number(b.intervalSec) || 1);
+        const rowCount = Math.max(0, Number(b.rowCount) || 0);
+        const variableMapping = b.variableMapping ?? {};
+        const headerImageModeRaw = String(b.headerImageMode ?? "").trim();
+        const headerImageMode = headerImageModeRaw === "url" || headerImageModeRaw === "mediaId" ? headerImageModeRaw : undefined;
+        const headerImageUrl = String(b.headerImageUrl ?? "").trim();
+        const headerImageMediaId = String(b.headerImageMediaId ?? "").trim();
+        if (!name || !phoneColumn || !templateName || !languageCode) {
+            return res.status(400).json({ error: "name, phoneColumn, templateName y languageCode son obligatorios" });
         }
-        normalized.push(row);
-        if (normalized.length >= 5e4)
-          break;
-      }
-      rowResults = normalized;
-    }
-    let mergedRowResults = rowResults;
-    if (rowResults !== void 0) {
-      const existingDoc = await MassCampaign.findOne({ _id: id, companyId: req.auth.companyId }).lean();
-      if (!existingDoc)
-        return res.status(404).json({ error: "Campaña no encontrada" });
-      mergedRowResults = mergeIncomingRowResultsWithExisting(existingDoc.rowResults, rowResults);
-    }
-    const $set = { status };
-    if (mergedRowResults !== void 0) {
-      $set.rowResults = mergedRowResults;
-      const stats = computeDeliveryStatsFromRows(mergedRowResults);
-      $set.sentCount = stats.sentCount;
-      $set.failCount = stats.failCount;
-      $set.deliveredCount = stats.deliveredCount;
-      $set.deliveryFailedCount = stats.deliveryFailedCount;
-      $set.pendingDeliveryCount = stats.pendingDeliveryCount;
-    } else {
-      $set.sentCount = sentCountBody;
-      $set.failCount = failCountBody;
-    }
-    const doc = await MassCampaign.findOneAndUpdate(
-      { _id: id, companyId: req.auth.companyId },
-      { $set },
-      { new: true }
-    ).lean();
-    if (!doc)
-      return res.status(404).json({ error: "Campaña no encontrada" });
-    return res.json(doc);
-  });
+        const doc = await MassCampaign.create({
+            companyId: req.auth.companyId,
+            name,
+            fileName,
+            phoneColumn,
+            templateName,
+            languageCode,
+            variableMapping,
+            headerImageMode,
+            headerImageUrl: headerImageUrl || undefined,
+            headerImageMediaId: headerImageMediaId || undefined,
+            intervalSec,
+            rowCount,
+            status: "draft",
+        });
+        return res.status(201).json(doc);
+    });
+    r.get("/massivity/campaigns", auth, async (req, res) => {
+        if (!req.auth?.companyId)
+            return res.status(403).json({ error: "Debes configurar tu empresa primero" });
+        const rows = await MassCampaign.find({ companyId: req.auth.companyId })
+            .sort({ createdAt: -1 })
+            .limit(30)
+            .select("-rowResults")
+            .lean();
+        return res.json(rows);
+    });
+    r.get("/massivity/campaigns/:id", auth, async (req, res) => {
+        if (!req.auth?.companyId)
+            return res.status(403).json({ error: "Debes configurar tu empresa primero" });
+        const id = String(req.params.id ?? "");
+        if (!isValidObjectId(id))
+            return res.status(400).json({ error: "ID inválido" });
+        const doc = await MassCampaign.findOne({ _id: id, companyId: req.auth.companyId }).lean();
+        if (!doc)
+            return res.status(404).json({ error: "Campaña no encontrada" });
+        return res.json(doc);
+    });
+    r.patch("/massivity/campaigns/:id/status", auth, async (req, res) => {
+        if (!req.auth?.companyId)
+            return res.status(403).json({ error: "Debes configurar tu empresa primero" });
+        const id = String(req.params.id ?? "");
+        if (!isValidObjectId(id))
+            return res.status(400).json({ error: "ID inválido" });
+        const status = String(req.body?.status ?? "").trim();
+        if (!["draft", "sent"].includes(status))
+            return res.status(400).json({ error: "status inválido" });
+        const sentCountBody = Math.max(0, Number(req.body?.sentCount) || 0);
+        const failCountBody = Math.max(0, Number(req.body?.failCount) || 0);
+        const rawRowResults = req.body.rowResults;
+        let rowResults;
+        if (Array.isArray(rawRowResults)) {
+            const normalized = [];
+            for (const item of rawRowResults) {
+                if (!item || typeof item !== "object")
+                    continue;
+                const o = item;
+                const rowIndex = Math.floor(Number(o.rowIndex));
+                if (!Number.isFinite(rowIndex) || rowIndex < 1)
+                    continue;
+                const phone = String(o.phone ?? "")
+                    .replace(/\D/g, "")
+                    .slice(0, 24);
+                const wamid = String(o.wamid ?? "")
+                    .trim()
+                    .slice(0, 160);
+                const deliveryStatus = String(o.deliveryStatus ?? "")
+                    .trim()
+                    .slice(0, 64);
+                const reason = String(o.reason ?? "")
+                    .trim()
+                    .slice(0, 500);
+                const row = { rowIndex, phone };
+                if (wamid)
+                    row.wamid = wamid;
+                if (typeof o.apiOk === "boolean")
+                    row.apiOk = o.apiOk;
+                if (deliveryStatus)
+                    row.deliveryStatus = deliveryStatus;
+                if (typeof o.ok === "boolean")
+                    row.ok = o.ok;
+                if (reason)
+                    row.reason = reason;
+                const dua = o.deliveryUpdatedAt;
+                if (dua) {
+                    const d = new Date(String(dua));
+                    if (!Number.isNaN(d.getTime()))
+                        row.deliveryUpdatedAt = d;
+                }
+                normalized.push(row);
+                if (normalized.length >= 50_000)
+                    break;
+            }
+            rowResults = normalized;
+        }
+        let mergedRowResults = rowResults;
+        if (rowResults !== undefined) {
+            const existingDoc = (await MassCampaign.findOne({ _id: id, companyId: req.auth.companyId }).lean());
+            if (!existingDoc)
+                return res.status(404).json({ error: "Campaña no encontrada" });
+            mergedRowResults = mergeIncomingRowResultsWithExisting(existingDoc.rowResults, rowResults);
+        }
+        const $set = { status };
+        if (mergedRowResults !== undefined) {
+            $set.rowResults = mergedRowResults;
+            const stats = computeDeliveryStatsFromRows(mergedRowResults);
+            $set.sentCount = stats.sentCount;
+            $set.failCount = stats.failCount;
+            $set.deliveredCount = stats.deliveredCount;
+            $set.deliveryFailedCount = stats.deliveryFailedCount;
+            $set.pendingDeliveryCount = stats.pendingDeliveryCount;
+        }
+        else {
+            $set.sentCount = sentCountBody;
+            $set.failCount = failCountBody;
+        }
+        const doc = await MassCampaign.findOneAndUpdate({ _id: id, companyId: req.auth.companyId }, { $set }, { new: true }).lean();
+        if (!doc)
+            return res.status(404).json({ error: "Campaña no encontrada" });
+        return res.json(doc);
+    });
     return r;
 }
 //# sourceMappingURL=sendApi.js.map

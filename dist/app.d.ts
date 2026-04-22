@@ -1,3 +1,4 @@
+import type { Express } from "express";
 export type CreateAppOptions = {
     webhookVerifyToken?: string;
     checkWebhookVerifyToken?: (token: string) => Promise<boolean>;
@@ -6,5 +7,5 @@ export type CreateAppOptions = {
     sendJwtSecret: string;
     serwpSendUrl: string;
 };
-export declare function createApp(opts: CreateAppOptions): import("express-serve-static-core").Express;
+export declare function createApp(opts: CreateAppOptions): Express;
 //# sourceMappingURL=app.d.ts.map

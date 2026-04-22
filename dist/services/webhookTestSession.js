@@ -1,20 +1,15 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.startLiveTest = startLiveTest;
-exports.cancelLiveTest = cancelLiveTest;
-exports.takeLiveTestIfActive = takeLiveTestIfActive;
 /** Sesión en memoria: usuario pulsa «Iniciar prueba» hasta que llega el primer mensaje al webhook o cancela. */
 const activeByCompany = new Map();
 /** Máximo que una sesión de prueba puede permanecer activa (seguridad). */
 const SESSION_MAX_MS = 2 * 60 * 60 * 1000;
-function startLiveTest(companyId) {
+export function startLiveTest(companyId) {
     activeByCompany.set(String(companyId), Date.now());
 }
-function cancelLiveTest(companyId) {
+export function cancelLiveTest(companyId) {
     activeByCompany.delete(String(companyId));
 }
 /** Si hay prueba activa y no expirada, la consume y devuelve true (una sola vez). */
-function takeLiveTestIfActive(companyId) {
+export function takeLiveTestIfActive(companyId) {
     const id = String(companyId);
     const started = activeByCompany.get(id);
     if (started == null)
@@ -26,3 +21,4 @@ function takeLiveTestIfActive(companyId) {
     activeByCompany.delete(id);
     return true;
 }
+//# sourceMappingURL=webhookTestSession.js.map

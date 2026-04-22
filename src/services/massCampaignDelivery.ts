@@ -126,29 +126,32 @@ async function sleep(ms: number): Promise<void> {
 }
 
 /** Igual que Message: el webhook puede llegar antes del PATCH que guarda el wamid en rowResults. */
-async function findCampaignWithWamid(companyId: unknown, wid: string) {
-  let doc = await MassCampaign.findOne({
+async function findCampaignWithWamid(
+  companyId: unknown,
+  wid: string,
+): Promise<{ _id: import("mongoose").Types.ObjectId } | null> {
+  let doc = (await MassCampaign.findOne({
     companyId,
     rowResults: { $elemMatch: { wamid: wid } },
   })
     .select({ _id: 1 })
-    .lean();
+    .lean()) as { _id: import("mongoose").Types.ObjectId } | null;
   if (doc?._id) return doc;
   await sleep(400);
-  doc = await MassCampaign.findOne({
+  doc = (await MassCampaign.findOne({
     companyId,
     rowResults: { $elemMatch: { wamid: wid } },
   })
     .select({ _id: 1 })
-    .lean();
+    .lean()) as { _id: import("mongoose").Types.ObjectId } | null;
   if (doc?._id) return doc;
   await sleep(1200);
-  return MassCampaign.findOne({
+  return (await MassCampaign.findOne({
     companyId,
     rowResults: { $elemMatch: { wamid: wid } },
   })
     .select({ _id: 1 })
-    .lean();
+    .lean()) as { _id: import("mongoose").Types.ObjectId } | null;
 }
 
 export async function syncMassCampaignRowFromWebhook(
@@ -200,7 +203,7 @@ export async function syncMassCampaignRowFromWebhook(
     arrayFilters: [{ "el.wamid": wid }],
   });
 
-  const fresh = await MassCampaign.findById(campaign._id).lean();
-  const stats = computeDeliveryStatsFromRows((fresh?.rowResults as RowLike[]) ?? []);
+  const fresh = (await MassCampaign.findById(campaign._id).lean()) as { rowResults?: RowLike[] } | null;
+  const stats = computeDeliveryStatsFromRows(fresh?.rowResults ?? []);
   await MassCampaign.updateOne({ _id: campaign._id }, { $set: stats });
 }

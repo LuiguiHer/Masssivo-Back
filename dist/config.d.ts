@@ -1,5 +1,5 @@
 import "dotenv/config";
-/** Credenciales y IDs alineados con la colección Postman */
+/** Credenciales globales opcionales (el portal usa credenciales por empresa en MongoDB). */
 export declare const config: {
     accessToken: string;
     graphVersion: string;
