@@ -1,4 +1,7 @@
 import { createHash, randomInt } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export function hashOtpCode(code: string): string {
   return createHash("sha256").update(code).digest("hex");
@@ -10,6 +13,28 @@ export function generateNumericOtp6(): string {
 
 export function normalizeDigits(input: string): string {
   return String(input ?? "").replace(/\D/g, "");
+}
+
+/**
+ * Texto con formato WhatsApp: *negrita*, _cursiva_.
+ * Imagen (si ser-wp la admite) + este texto como cuerpo/caption.
+ */
+export function buildOtpAccessCaption(code: string): string {
+  return `*MASSSIVO*
+
+Codigo de Acceso:
+_${code}_
+
+Expira en 5 minutos. Tienes hasta 3 intentos.`;
+}
+
+export function buildOtpRegisterCaption(code: string): string {
+  return `*MASSSIVO*
+
+Codigo de Registro:
+_${code}_
+
+Expira en 5 minutos. Tienes hasta 3 intentos.`;
 }
 
 function collectErrorText(err: unknown): string {
@@ -24,13 +49,13 @@ function collectErrorText(err: unknown): string {
   return parts.join(" | ");
 }
 
-export async function postSerwpSend(sendUrl: string, numberDigits: string, message: string): Promise<void> {
-  const payload = JSON.stringify({ number: numberDigits, message });
+async function postSerwpPayload(sendUrl: string, payload: Record<string, string>): Promise<void> {
+  const body = JSON.stringify(payload);
   async function doPost(url: string) {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: payload,
+      body,
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`ser-wp send falló (${res.status}): ${text.slice(0, 500)}`);
@@ -39,7 +64,6 @@ export async function postSerwpSend(sendUrl: string, numberDigits: string, messa
   try {
     await doPost(sendUrl);
   } catch (e) {
-    // HTTPS a un puerto que sirve HTTP plano: Node suele envolver el fallo en TypeError("fetch failed") + cause SSL.
     const combined = collectErrorText(e);
     const isSslMismatch = /ERR_SSL_PACKET_LENGTH_TOO_LONG|SSL routines|packet length too long/i.test(combined);
     if (isSslMismatch && /^https:\/\/127\.0\.0\.1(?::\d+)?\//.test(sendUrl)) {
@@ -49,4 +73,38 @@ export async function postSerwpSend(sendUrl: string, numberDigits: string, messa
     }
     throw e;
   }
+}
+
+export async function postSerwpSend(sendUrl: string, numberDigits: string, message: string): Promise<void> {
+  await postSerwpPayload(sendUrl, { number: numberDigits, message });
+}
+
+/**
+ * OTP con imagen ISO + pie de mensaje, solo vía ser-wp.
+ * Payload extendido: `imageBase64`, `imageMimeType`, `imageFileName` (el servicio ser-wp debe enviar
+ * la imagen y debajo el `message` como caption o mensaje de texto).
+ */
+export async function postSerwpSendOtpWithImage(
+  sendUrl: string,
+  numberDigits: string,
+  message: string,
+): Promise<void> {
+  const dir = dirname(fileURLToPath(import.meta.url));
+  const imagePath = join(dir, "../assets/iso_masssivo_little.PNG");
+  let imageBase64: string;
+  try {
+    const buf = await readFile(imagePath);
+    imageBase64 = buf.toString("base64");
+  } catch (e) {
+    console.error("[ser-wp/otp] no se pudo leer la imagen ISO, se envía solo texto:", e);
+    await postSerwpSend(sendUrl, numberDigits, message);
+    return;
+  }
+  await postSerwpPayload(sendUrl, {
+    number: numberDigits,
+    message,
+    imageBase64,
+    imageMimeType: "image/png",
+    imageFileName: "iso_masssivo_little.PNG",
+  });
 }

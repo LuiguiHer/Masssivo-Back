@@ -14,11 +14,15 @@ import { OtpChallenge } from "../models/OtpChallenge.js";
 import { User } from "../models/User.js";
 import { UploadedMedia } from "../models/UploadedMedia.js";
 import { TemplateSampleUpload } from "../models/TemplateSampleUpload.js";
-import { generateNumericOtp6, hashOtpCode, normalizeDigits, postSerwpSend } from "../services/serwpSend.js";
+import { buildOtpAccessCaption, buildOtpRegisterCaption, generateNumericOtp6, hashOtpCode, normalizeDigits, postSerwpSendOtpWithImage, } from "../services/serwpSend.js";
 import { computeDeliveryStatsFromRows, mergeIncomingRowResultsWithExisting, } from "../services/massCampaignDelivery.js";
 import { canonicalWaId } from "../services/waId.js";
 import { cancelLiveTest, startLiveTest } from "../services/webhookTestSession.js";
 import { requireAuth } from "../middleware/requireAuth.js";
+async function deliverOtpCode(deps, whatsappDigits, code, mode) {
+    const caption = mode === "login" ? buildOtpAccessCaption(code) : buildOtpRegisterCaption(code);
+    await postSerwpSendOtpWithImage(deps.serwpSendUrl, whatsappDigits, caption);
+}
 /** ID de app Meta para uploads resumibles; opcional por empresa o META_APP_ID en entorno. */
 function resolveMetaAppId(cfg) {
     const fromCfg = String(cfg.waMetaAppId ?? "").trim();
@@ -202,8 +206,7 @@ export function createSendApiRouter(deps) {
             if (dupUser)
                 return res.status(409).json({ error: "Ya existe un usuario con ese email o WhatsApp" });
             const { code } = await createOtp("register", user.whatsapp, { user });
-            const msg = `Luherd Send — código de registro: ${code}\nExpira en 5 minutos. Tienes hasta 3 intentos.`;
-            await postSerwpSend(deps.serwpSendUrl, user.whatsapp, msg);
+            await deliverOtpCode(deps, user.whatsapp, code, "register");
             return res.json({ ok: true, expiresInSec: 300, attempts: 3 });
         }
         catch (e) {
@@ -251,8 +254,7 @@ export function createSendApiRouter(deps) {
             if (u.status !== "active")
                 return res.status(403).json({ error: "Usuario deshabilitado" });
             const { code } = await createOtp("login", whatsapp);
-            const msg = `Luherd Send — código de acceso: ${code}\nExpira en 5 minutos. Tienes hasta 3 intentos.`;
-            await postSerwpSend(deps.serwpSendUrl, whatsapp, msg);
+            await deliverOtpCode(deps, whatsapp, code, "login");
             return res.json({ ok: true, expiresInSec: 300, attempts: 3 });
         }
         catch (e) {

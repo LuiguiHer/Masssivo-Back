@@ -9,7 +9,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && mkdir -p dist/assets && cp -f src/assets/iso_masssivo_little.PNG dist/assets/",
     "start": "node dist/index.js",
     "send-text": "tsx src/cli/sendText.ts"
   },

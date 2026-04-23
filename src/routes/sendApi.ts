@@ -17,7 +17,14 @@ import { TemplateSampleUpload } from "../models/TemplateSampleUpload.js";
 import type { CompanyDoc } from "../models/Company.js";
 import type { CompanyWhatsappConfigDoc } from "../models/CompanyWhatsappConfig.js";
 import type { UserDoc } from "../models/User.js";
-import { generateNumericOtp6, hashOtpCode, normalizeDigits, postSerwpSend } from "../services/serwpSend.js";
+import {
+  buildOtpAccessCaption,
+  buildOtpRegisterCaption,
+  generateNumericOtp6,
+  hashOtpCode,
+  normalizeDigits,
+  postSerwpSendOtpWithImage,
+} from "../services/serwpSend.js";
 import {
   computeDeliveryStatsFromRows,
   mergeIncomingRowResultsWithExisting,
@@ -41,6 +48,11 @@ type SendApiDeps = {
   jwtSecret: string;
   serwpSendUrl: string;
 };
+
+async function deliverOtpCode(deps: SendApiDeps, whatsappDigits: string, code: string, mode: "login" | "register"): Promise<void> {
+  const caption = mode === "login" ? buildOtpAccessCaption(code) : buildOtpRegisterCaption(code);
+  await postSerwpSendOtpWithImage(deps.serwpSendUrl, whatsappDigits, caption);
+}
 
 /** Texto fijo y cabecera de imagen para el inbox; no se envía a la API de Graph (solo `storedPayload` en DB). */
 type InboxTemplateDisplay = {
@@ -225,8 +237,7 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
       if (dupUser) return res.status(409).json({ error: "Ya existe un usuario con ese email o WhatsApp" });
 
       const { code } = await createOtp("register", user.whatsapp, { user });
-      const msg = `Luherd Send — código de registro: ${code}\nExpira en 5 minutos. Tienes hasta 3 intentos.`;
-      await postSerwpSend(deps.serwpSendUrl, user.whatsapp, msg);
+      await deliverOtpCode(deps, user.whatsapp, code, "register");
       return res.json({ ok: true, expiresInSec: 300, attempts: 3 });
     } catch (e) {
       console.error("[send/register/request-otp]", e);
@@ -277,8 +288,7 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
       if (u.status !== "active") return res.status(403).json({ error: "Usuario deshabilitado" });
 
       const { code } = await createOtp("login", whatsapp);
-      const msg = `Luherd Send — código de acceso: ${code}\nExpira en 5 minutos. Tienes hasta 3 intentos.`;
-      await postSerwpSend(deps.serwpSendUrl, whatsapp, msg);
+      await deliverOtpCode(deps, whatsapp, code, "login");
       return res.json({ ok: true, expiresInSec: 300, attempts: 3 });
     } catch (e) {
       console.error("[send/login/request-otp]", e);
