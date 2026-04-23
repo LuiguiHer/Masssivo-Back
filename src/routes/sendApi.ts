@@ -33,6 +33,8 @@ import { canonicalWaId } from "../services/waId.js";
 import { cancelLiveTest, startLiveTest } from "../services/webhookTestSession.js";
 import type { AuthedRequest } from "../middleware/requireAuth.js";
 import { requireAuth } from "../middleware/requireAuth.js";
+import { config } from "../config.js";
+import { queueLandingNotifyToWhatsApp } from "../services/landingNotifyWhatsApp.js";
 
 type LeanUser = UserDoc & { _id: Types.ObjectId };
 type LeanCompany = CompanyDoc & { _id: Types.ObjectId };
@@ -200,6 +202,32 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     res.setHeader("Content-Type", doc.mimeType || "application/octet-stream");
     res.setHeader("Cache-Control", "public, max-age=86400");
     return res.send(Buffer.from(doc.data));
+  });
+
+  /** Formulario de contacto de la landing (sin JWT). Honeypot: campo `_hp` debe ir vacío. */
+  r.post("/public/landing-contact", async (req, res) => {
+    try {
+      const b = req.body ?? {};
+      if (String(b._hp ?? "").trim()) {
+        return res.json({ ok: true });
+      }
+      const name = String(b.name ?? "").trim();
+      const company = String(b.company ?? "").trim();
+      const phone = String(b.phone ?? "").trim();
+      const need = String(b.need ?? "").trim();
+      const message = String(b.message ?? "").trim();
+      if (!name || !company || !phone || !need) {
+        return res.status(400).json({ error: "Faltan campos obligatorios" });
+      }
+      if (name.length > 200 || company.length > 200 || phone.length > 50 || need.length > 500 || message.length > 8000) {
+        return res.status(400).json({ error: "Texto no válido" });
+      }
+      queueLandingNotifyToWhatsApp(deps.serwpSendUrl, config.numberListWhats, { name, company, phone, need, message });
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("[public/landing-contact]", e);
+      return res.status(500).json({ error: "No se pudo registrar la solicitud. Intenta de nuevo o escríbenos por WhatsApp." });
+    }
   });
 
   /** Sube la muestra a MongoDB y devuelve una URL HTTPS pública para `header_handle` (evita fallos de la API resumible de Meta). */

@@ -26,4 +26,7 @@ export const config = {
   /** Auth / portal send */
   sendJwtSecret: req("SEND_JWT_SECRET"),
   serwpSendUrl: opt("SERWP_SEND_URL") ?? "http://127.0.0.1:8444/api/send",
+
+  /** Formulario landing — destinatarios WhatsApp (solo dígitos, separados por comas). Ej: 573001112233,573004445556 */
+  numberListWhats: opt("NumberListWhats"),
 };

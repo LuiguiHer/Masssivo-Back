@@ -14,5 +14,7 @@ export declare const config: {
     /** Auth / portal send */
     sendJwtSecret: string;
     serwpSendUrl: string;
+    /** Formulario landing — destinatarios WhatsApp (solo dígitos, separados por comas). Ej: 573001112233,573004445556 */
+    numberListWhats: string | undefined;
 };
 //# sourceMappingURL=config.d.ts.map

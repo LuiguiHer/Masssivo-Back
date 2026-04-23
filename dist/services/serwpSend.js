@@ -12,24 +12,35 @@ export function normalizeDigits(input) {
     return String(input ?? "").replace(/\D/g, "");
 }
 /**
+ * En Cloud API de Meta el “footer” es un componente aparte en plantillas; aquí (ser-wp / caption único)
+ * el pie es texto al final del mismo mensaje, separado por una línea en blanco.
+ * Opcional: variable `OTP_MESSAGE_FOOTER` (formato WhatsApp: *negrita*, _cursiva_).
+ */
+function appendOptionalOtpFooter(body) {
+    const footer = process.env.OTP_MESSAGE_FOOTER?.trim();
+    if (!footer)
+        return body;
+    return `${body}\n\n${footer}`;
+}
+/**
  * Texto con formato WhatsApp: *negrita*, _cursiva_.
  * Imagen (si ser-wp la admite) + este texto como cuerpo/caption.
  */
 export function buildOtpAccessCaption(code) {
-    return `*MASSSIVO*
+    return appendOptionalOtpFooter(`*MASSSIVO*
 
 Codigo de Acceso:
 _${code}_
 
-Expira en 5 minutos. Tienes hasta 3 intentos.`;
+Expira en 5 minutos. Tienes hasta 3 intentos.`);
 }
 export function buildOtpRegisterCaption(code) {
-    return `*MASSSIVO*
+    return appendOptionalOtpFooter(`*MASSSIVO*
 
 Codigo de Registro:
 _${code}_
 
-Expira en 5 minutos. Tienes hasta 3 intentos.`;
+Expira en 5 minutos. Tienes hasta 3 intentos.`);
 }
 function collectErrorText(err) {
     const parts = [];
