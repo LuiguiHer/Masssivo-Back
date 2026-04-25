@@ -6,6 +6,9 @@ const massCampaignSchema = new mongoose.Schema({
     phoneColumn: { type: String, required: true, trim: true },
     templateName: { type: String, required: true, trim: true },
     languageCode: { type: String, required: true, trim: true },
+    /** `cloud_hsm` (Meta) vs `qr_baileys` (Emisión / plantilla QR). */
+    sendChannel: { type: String, enum: ["cloud_hsm", "qr_baileys"], default: "cloud_hsm" },
+    qrMessageTemplateId: { type: mongoose.Schema.Types.ObjectId, required: false, index: true },
     variableMapping: { type: mongoose.Schema.Types.Mixed },
     headerImageMode: { type: String, enum: ["url", "mediaId"], trim: true },
     headerImageUrl: { type: String, trim: true },

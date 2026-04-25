@@ -1,8 +1,12 @@
+import { MongoServerError } from "mongodb";
 import { Router } from "express";
 import crypto from "node:crypto";
+import { unlink } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import jwt from "jsonwebtoken";
 import multer from "multer";
-import { isValidObjectId } from "mongoose";
+import { isValidObjectId, Types } from "mongoose";
 import { Chat } from "../models/Chat.js";
 import { Client } from "../models/Client.js";
 import { Company } from "../models/Company.js";
@@ -10,6 +14,7 @@ import { CompanyWebhookVerifyToken } from "../models/CompanyWebhookVerifyToken.j
 import { CompanyWhatsappConfig } from "../models/CompanyWhatsappConfig.js";
 import { Message } from "../models/Message.js";
 import { MassCampaign } from "../models/MassCampaign.js";
+import { QrMessageTemplate } from "../models/QrMessageTemplate.js";
 import { OtpChallenge } from "../models/OtpChallenge.js";
 import { User } from "../models/User.js";
 import { UploadedMedia } from "../models/UploadedMedia.js";
@@ -21,6 +26,8 @@ import { cancelLiveTest, startLiveTest } from "../services/webhookTestSession.js
 import { requireAuth } from "../middleware/requireAuth.js";
 import { config } from "../config.js";
 import { queueLandingNotifyToWhatsApp } from "../services/landingNotifyWhatsApp.js";
+import { assertMetaStyleConsecutiveTemplateVarsInText } from "../services/qrTemplateVars.js";
+import { deleteObjectFromMediaService, uploadFileToMediaService } from "../services/mediaServiceClient.js";
 async function deliverOtpCode(deps, whatsappDigits, code, mode) {
     const caption = mode === "login" ? buildOtpAccessCaption(code) : buildOtpRegisterCaption(code);
     await postSerwpSendOtpWithImage(deps.serwpSendUrl, whatsappDigits, caption);
@@ -156,10 +163,81 @@ function inferPublicSendApiBase(req) {
     const host = (typeof xfHostRaw === "string" ? xfHostRaw.split(",")[0].trim() : "") || req.get("host") || "localhost";
     return `${proto}://${host}/api/send`;
 }
+function resolveOutboundChannel(company) {
+    if (company && company.outboundChannel === "qr_baileys")
+        return "qr_baileys";
+    return "cloud_api";
+}
 export function createSendApiRouter(deps) {
     const r = Router();
     const auth = requireAuth(deps.jwtSecret);
     const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+    const qrTemplateDisk = multer({
+        storage: multer.diskStorage({
+            destination: (_req, _f, cb) => cb(null, os.tmpdir()),
+            filename: (_req, f, cb) => cb(null, `qrtpl-${Date.now()}-${crypto.randomBytes(8).toString("hex")}${path.extname(f.originalname) || ""}`),
+        }),
+        limits: { fileSize: 8 * 1024 * 1024 },
+        fileFilter: (_r, f, cb) => {
+            const m = (f.mimetype || "").toLowerCase();
+            if (["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"].includes(m))
+                return cb(null, true);
+            cb(new Error("Solo se admiten imágenes JPEG, PNG, GIF o WebP"));
+        },
+    });
+    const isQrStorageEnabled = () => Boolean(deps.mediaServiceKey && deps.mediaPublicBaseUrl && deps.mediaServiceUrl);
+    const enrichQr = (raw) => {
+        if (!raw)
+            return raw;
+        const o = { ...raw };
+        const base = String(deps.mediaPublicBaseUrl ?? "").replace(/\/$/, "");
+        const k = String(o.imageObjectKey ?? "").trim();
+        if (k && base) {
+            o.imageUrl = `${base}/${k.split("/").map(encodeURIComponent).join("/")}`;
+        }
+        else {
+            const u0 = String(o.imageUrl ?? "").trim();
+            if (u0 && base && /127\.0\.0\.1:9000|localhost:9000/.test(u0)) {
+                const origin = base.match(/^(https?:\/\/[^/]+)/)?.[1];
+                if (origin) {
+                    try {
+                        o.imageUrl = origin + new URL(u0).pathname;
+                    }
+                    catch {
+                        o.imageUrl = u0;
+                    }
+                }
+                else
+                    o.imageUrl = u0;
+            }
+            else
+                o.imageUrl = u0;
+            if (!String(o.imageUrl ?? "").trim())
+                o.imageUrl = "";
+        }
+        return o;
+    };
+    const maybeQrTemplateMultipart = (req, res, next) => {
+        const ct = String(req.headers["content-type"] || "").toLowerCase();
+        if (ct.includes("multipart/form-data")) {
+            return qrTemplateDisk.single("image")(req, res, (err) => {
+                if (err) {
+                    return res.status(400).json({ error: err.message || "Solicitud multipart no válida" });
+                }
+                return next();
+            });
+        }
+        return next();
+    };
+    const qrBase = deps.masssivoQrWaBaseUrl?.replace(/\/$/, "");
+    const qrKey = deps.masssivoQrWaKey;
+    const forwardMasssivoQr = (companyId, subPath, init) => {
+        const url = `${qrBase}/v1/tenants/${encodeURIComponent(companyId)}${subPath}`;
+        const h = { "X-Internal-Key": qrKey };
+        if (init.body != null)
+            h["Content-Type"] = "application/json";
+        return fetch(url, { method: init.method ?? "GET", body: init.body, headers: h });
+    };
     /** Sin auth: Meta y otros clientes deben poder GET por HTTPS el archivo de muestra. */
     r.get("/public/template-sample/:token", async (req, res) => {
         const token = String(req.params.token ?? "").trim();
@@ -337,6 +415,7 @@ export function createSendApiRouter(deps) {
                 email: c.email,
                 legalName: c.legalName,
                 phone: c.phone,
+                outboundChannel: resolveOutboundChannel(c),
             },
             whatsappConfig: wc
                 ? {
@@ -384,11 +463,24 @@ export function createSendApiRouter(deps) {
         const dupCompanyNit = await Company.findOne({ nit: company.nit }).lean();
         if (dupCompanyNit)
             return res.status(409).json({ error: "Ya existe una empresa con ese NIT" });
-        const companyDoc = await Company.create(company);
-        u.companyId = companyDoc._id;
-        await u.save();
-        const token = signToken(deps, String(u._id), String(companyDoc._id));
-        return res.status(201).json({ token, company: { id: companyDoc._id } });
+        try {
+            const companyDoc = await Company.create(company);
+            u.companyId = companyDoc._id;
+            await u.save();
+            const token = signToken(deps, String(u._id), String(companyDoc._id));
+            return res.status(201).json({ token, company: { id: companyDoc._id } });
+        }
+        catch (e) {
+            if (e instanceof MongoServerError && e.code === 11000) {
+                const key = e.keyPattern ? Object.keys(e.keyPattern)[0] : "";
+                console.error("[POST /company] duplicate key", e.keyValue);
+                const msg = key === "nit"
+                    ? "Ya existe una empresa con ese NIT"
+                    : "No se pudo crear la empresa: conflicto de datos (índice único). Contacta soporte.";
+                return res.status(409).json({ error: msg });
+            }
+            throw e;
+        }
     });
     r.put("/company", auth, async (req, res) => {
         if (!req.auth)
@@ -426,8 +518,24 @@ export function createSendApiRouter(deps) {
                 email: current.email,
                 legalName: current.legalName,
                 phone: current.phone,
+                outboundChannel: resolveOutboundChannel(current),
             },
         });
+    });
+    r.patch("/company/messaging", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const u = await User.findById(req.auth.userId);
+        if (!u)
+            return res.status(404).json({ error: "Usuario no encontrado" });
+        if (!u.companyId)
+            return res.status(404).json({ error: "No tienes empresa configurada" });
+        const b = (req.body ?? {});
+        if (b.outboundChannel !== "cloud_api" && b.outboundChannel !== "qr_baileys") {
+            return res.status(400).json({ error: "outboundChannel debe ser cloud_api o qr_baileys" });
+        }
+        await Company.findByIdAndUpdate(u.companyId, { $set: { outboundChannel: b.outboundChannel } });
+        return res.json({ ok: true, outboundChannel: b.outboundChannel });
     });
     r.delete("/company", auth, async (req, res) => {
         if (!req.auth)
@@ -928,6 +1036,15 @@ export function createSendApiRouter(deps) {
     r.post("/messages/template", auth, async (req, res) => {
         if (!req.auth)
             return res.status(401).json({ error: "No autenticado" });
+        const u0 = await User.findById(req.auth.userId).lean();
+        if (!u0?.companyId)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const co0 = await Company.findById(u0.companyId).lean();
+        if (resolveOutboundChannel(co0) === "qr_baileys") {
+            return res.status(400).json({
+                error: "Canal de salida: WhatsApp Web (QR). Las plantillas HSM requieren Cloud API. Cambiá el canal en Configuración o enviá solo texto.",
+            });
+        }
         const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
         if ("error" in got) {
             const err = got.error ?? { code: 500, message: "Error interno" };
@@ -976,11 +1093,18 @@ export function createSendApiRouter(deps) {
         catch {
             data = { raw: text };
         }
-        if (!rMeta.ok)
+        if (!rMeta.ok) {
+            console.error("[whatsapp/graph] send template FAILED", JSON.stringify({
+                httpStatus: rMeta.status,
+                companyId: req.auth?.companyId ?? null,
+                userId: req.auth?.userId ?? null,
+                to,
+                templateName: name,
+                languageCode,
+                metaError: data,
+            }));
             return res.status(rMeta.status).json({ error: "Meta send template failed", detail: data });
-        const u = await User.findById(req.auth.userId).lean();
-        if (!u?.companyId)
-            return res.status(400).json({ error: "Debes crear empresa primero" });
+        }
         const wamid = typeof data === "object" && data && Array.isArray(data.messages)
             ? data.messages?.[0]?.id
             : undefined;
@@ -989,9 +1113,9 @@ export function createSendApiRouter(deps) {
             (`Plantilla: ${name} (${languageCode})` +
                 (Array.isArray(components) && components.length ? " · con variables" : ""));
         if (wamid) {
-            await Message.findOneAndUpdate({ companyId: u.companyId, wamid }, {
+            await Message.findOneAndUpdate({ companyId: u0.companyId, wamid }, {
                 $setOnInsert: {
-                    companyId: u.companyId,
+                    companyId: u0.companyId,
                     waId: to,
                     wamid,
                     direction: "out",
@@ -1002,34 +1126,87 @@ export function createSendApiRouter(deps) {
                 },
             }, { upsert: true });
         }
-        await Chat.findOneAndUpdate({ companyId: u.companyId, waId: to }, {
+        await Chat.findOneAndUpdate({ companyId: u0.companyId, waId: to }, {
             $set: {
                 lastMessageAt: now,
                 lastMessagePreview: bodyPreview,
             },
-            $setOnInsert: { companyId: u.companyId, waId: to },
+            $setOnInsert: { companyId: u0.companyId, waId: to },
         }, { upsert: true });
-        console.info("[whatsapp/graph] send template ok", JSON.stringify({ companyId: String(u.companyId), to, wamid: wamid ?? null, templateName: name, languageCode, metaResponse: data }, null, 0));
+        console.info("[whatsapp/graph] send template ok", JSON.stringify({ companyId: String(u0.companyId), to, wamid: wamid ?? null, templateName: name, languageCode, metaResponse: data }, null, 0));
         return res.json(data);
     });
     r.post("/messages/text", auth, async (req, res) => {
         if (!req.auth)
             return res.status(401).json({ error: "No autenticado" });
-        const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
-        if ("error" in got) {
-            const err = got.error ?? { code: 500, message: "Error interno" };
-            return res.status(err.code).json({ error: err.message });
-        }
-        const { cfg } = got;
         const u = await User.findById(req.auth.userId).lean();
         if (!u?.companyId)
             return res.status(400).json({ error: "Debes crear empresa primero" });
+        const company = await Company.findById(u.companyId).lean();
         const b = req.body ?? {};
         const to = canonicalWaId(normalizeDigits(b.to ?? ""));
         const text = String(b.text ?? "").trim();
         const displayName = String(b.displayName ?? "").trim();
         if (!to || !text)
             return res.status(400).json({ error: "to y text son obligatorios" });
+        if (resolveOutboundChannel(company) === "qr_baileys") {
+            if (!qrBase || !qrKey) {
+                return res.status(503).json({ error: "Canal QR no disponible (servicio no configurado en el API)" });
+            }
+            let r2;
+            try {
+                r2 = await forwardMasssivoQr(String(u.companyId), "/messages/text", {
+                    method: "POST",
+                    body: JSON.stringify({ to, text }),
+                });
+            }
+            catch (e) {
+                console.error("[send/messages/text qr]", e);
+                return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+            }
+            const rawQ = await r2.text();
+            if (!r2.ok) {
+                let detail = rawQ;
+                try {
+                    detail = rawQ ? JSON.parse(rawQ) : null;
+                }
+                catch {
+                    /* use rawQ */
+                }
+                return res.status(r2.status).json({ error: "Envío por QR fallido", detail });
+            }
+            const wamid = `qr-out-${new Types.ObjectId().toString()}`;
+            const now = new Date();
+            const payload = { channel: "qr_baileys", to, type: "text", text: { body: text } };
+            await Message.findOneAndUpdate({ companyId: u.companyId, wamid }, {
+                $setOnInsert: {
+                    companyId: u.companyId,
+                    waId: to,
+                    wamid,
+                    direction: "out",
+                    type: "text",
+                    bodyText: text,
+                    payload,
+                    timestamp: now,
+                },
+            }, { upsert: true });
+            await Chat.findOneAndUpdate({ companyId: u.companyId, waId: to }, {
+                $set: {
+                    lastMessageAt: now,
+                    lastMessagePreview: text,
+                    ...(displayName ? { displayName } : {}),
+                },
+                $setOnInsert: { companyId: u.companyId, waId: to },
+            }, { upsert: true });
+            console.info("[qr-wa] send text ok", JSON.stringify({ companyId: String(u.companyId), to, wamid, synthetic: true }, null, 0));
+            return res.json({ messaging_product: "whatsapp", channel: "qr_baileys", messages: [{ id: wamid }] });
+        }
+        const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
+        if ("error" in got) {
+            const err = got.error ?? { code: 500, message: "Error interno" };
+            return res.status(err.code).json({ error: err.message });
+        }
+        const { cfg } = got;
         const payload = {
             messaging_product: "whatsapp",
             to,
@@ -1084,18 +1261,98 @@ export function createSendApiRouter(deps) {
         console.info("[whatsapp/graph] send text ok", JSON.stringify({ companyId: String(u.companyId), to, wamid: wamid ?? null, metaResponse: data }, null, 0));
         return res.json(data);
     });
+    /** Imagen por URL + leyenda opcional; solo canal WhatsApp Web (QR) → masssivo-qr-wa. */
+    r.post("/messages/qr-image", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const u = await User.findById(req.auth.userId).lean();
+        if (!u?.companyId)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const company = await Company.findById(u.companyId).lean();
+        if (resolveOutboundChannel(company) !== "qr_baileys") {
+            return res.status(400).json({
+                error: "El envío de imagen por URL con QR solo aplica con canal WhatsApp Web (QR) en Configuración → Mensajes.",
+            });
+        }
+        if (!qrBase || !qrKey) {
+            return res.status(503).json({ error: "Canal QR no disponible (servicio no configurado en el API)" });
+        }
+        const b = req.body ?? {};
+        const to = canonicalWaId(normalizeDigits(b.to ?? ""));
+        const imageUrl = String(b.imageUrl ?? "").trim();
+        const caption = String(b.caption ?? "").trim();
+        const displayName = String(b.displayName ?? "").trim();
+        if (!to || !imageUrl)
+            return res.status(400).json({ error: "to e imageUrl son obligatorios" });
+        if (!/^https?:\/\//i.test(imageUrl))
+            return res.status(400).json({ error: "imageUrl debe ser http(s)" });
+        let r2;
+        try {
+            r2 = await forwardMasssivoQr(String(u.companyId), "/messages/image-url", {
+                method: "POST",
+                body: JSON.stringify({ to, imageUrl, ...(caption ? { caption } : {}) }),
+            });
+        }
+        catch (e) {
+            console.error("[send/messages/qr-image]", e);
+            return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+        }
+        const rawQ = await r2.text();
+        if (!r2.ok) {
+            let detail = rawQ;
+            try {
+                detail = rawQ ? JSON.parse(rawQ) : null;
+            }
+            catch {
+                /* use rawQ */
+            }
+            return res.status(r2.status).json({ error: "Envío por QR fallido", detail });
+        }
+        const wamid = `qr-out-${new Types.ObjectId().toString()}`;
+        const now = new Date();
+        const preview = caption || "[imagen]";
+        const payload = { channel: "qr_baileys", to, type: "image", imageUrl, caption: caption || undefined };
+        await Message.findOneAndUpdate({ companyId: u.companyId, wamid }, {
+            $setOnInsert: {
+                companyId: u.companyId,
+                waId: to,
+                wamid,
+                direction: "out",
+                type: "image",
+                bodyText: preview,
+                payload,
+                timestamp: now,
+            },
+        }, { upsert: true });
+        await Chat.findOneAndUpdate({ companyId: u.companyId, waId: to }, {
+            $set: {
+                lastMessageAt: now,
+                lastMessagePreview: preview,
+                ...(displayName ? { displayName } : {}),
+            },
+            $setOnInsert: { companyId: u.companyId, waId: to },
+        }, { upsert: true });
+        console.info("[qr-wa] send image-url ok", JSON.stringify({ companyId: String(u.companyId), to, wamid, synthetic: true }, null, 0));
+        return res.json({ messaging_product: "whatsapp", channel: "qr_baileys", messages: [{ id: wamid }] });
+    });
     r.post("/messages/image", auth, upload.single("file"), async (req, res) => {
         if (!req.auth)
             return res.status(401).json({ error: "No autenticado" });
+        const u = await User.findById(req.auth.userId).lean();
+        if (!u?.companyId)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const coImg = await Company.findById(u.companyId).lean();
+        if (resolveOutboundChannel(coImg) === "qr_baileys") {
+            return res.status(400).json({
+                error: "Canal de salida: WhatsApp Web (QR). Para enviar imágenes subí el archivo desde Mensajes o usá Emisión con plantilla imagen (URL del servidor).",
+            });
+        }
         const got = await getCompanyWhatsappConfigByAuthUser(req.auth.userId);
         if ("error" in got) {
             const err = got.error ?? { code: 500, message: "Error interno" };
             return res.status(err.code).json({ error: err.message });
         }
         const { cfg } = got;
-        const u = await User.findById(req.auth.userId).lean();
-        if (!u?.companyId)
-            return res.status(400).json({ error: "Debes crear empresa primero" });
         const to = canonicalWaId(normalizeDigits(req.body?.to ?? ""));
         const caption = String(req.body?.caption ?? "").trim();
         const displayName = String(req.body?.displayName ?? "").trim();
@@ -1450,6 +1707,10 @@ export function createSendApiRouter(deps) {
         if (!name || !phoneColumn || !templateName || !languageCode) {
             return res.status(400).json({ error: "name, phoneColumn, templateName y languageCode son obligatorios" });
         }
+        const sendChannelRaw = String(b.sendChannel ?? "").trim();
+        const sendChannel = sendChannelRaw === "qr_baileys" ? "qr_baileys" : "cloud_hsm";
+        const qrTplRaw = String(b.qrMessageTemplateId ?? "").trim();
+        const qrMessageTemplateId = sendChannel === "qr_baileys" && qrTplRaw && isValidObjectId(qrTplRaw) ? new Types.ObjectId(qrTplRaw) : undefined;
         const doc = await MassCampaign.create({
             companyId: req.auth.companyId,
             name,
@@ -1457,6 +1718,8 @@ export function createSendApiRouter(deps) {
             phoneColumn,
             templateName,
             languageCode,
+            sendChannel,
+            ...(qrMessageTemplateId ? { qrMessageTemplateId } : {}),
             variableMapping,
             headerImageMode,
             headerImageUrl: headerImageUrl || undefined,
@@ -1470,7 +1733,15 @@ export function createSendApiRouter(deps) {
     r.get("/massivity/campaigns", auth, async (req, res) => {
         if (!req.auth?.companyId)
             return res.status(403).json({ error: "Debes configurar tu empresa primero" });
-        const rows = await MassCampaign.find({ companyId: req.auth.companyId })
+        const ch = String(req.query.sendChannel ?? "").trim();
+        const filter = { companyId: req.auth.companyId };
+        if (ch === "qr_baileys") {
+            filter.sendChannel = "qr_baileys";
+        }
+        else if (ch === "cloud_hsm") {
+            filter.sendChannel = { $ne: "qr_baileys" };
+        }
+        const rows = await MassCampaign.find(filter)
             .sort({ createdAt: -1 })
             .limit(30)
             .select("-rowResults")
@@ -1570,6 +1841,474 @@ export function createSendApiRouter(deps) {
         if (!doc)
             return res.status(404).json({ error: "Campaña no encontrada" });
         return res.json(doc);
+    });
+    /** --- Plantillas de mensaje para campaña QR (guardadas en Mongo, no Meta) --- */
+    r.get("/qr/templates", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        try {
+            const list = await QrMessageTemplate.find({ companyId: new Types.ObjectId(String(cid)) })
+                .sort({ updatedAt: -1 })
+                .lean();
+            return res.json(list.map((row) => enrichQr(row) ?? row));
+        }
+        catch (e) {
+            console.error("[send/qr/templates GET]", e);
+            return res.status(500).json({ error: "Error al listar plantillas" });
+        }
+    });
+    r.get("/qr/templates/:id", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const { id } = req.params;
+        if (!isValidObjectId(id))
+            return res.status(400).json({ error: "Id inválido" });
+        try {
+            const doc = await QrMessageTemplate.findOne({ _id: id, companyId: new Types.ObjectId(String(cid)) }).lean();
+            if (!doc)
+                return res.status(404).json({ error: "Plantilla no encontrada" });
+            return res.json(enrichQr(doc) ?? doc);
+        }
+        catch (e) {
+            console.error("[send/qr/templates/:id GET]", e);
+            return res.status(500).json({ error: "Error al leer plantilla" });
+        }
+    });
+    r.post("/qr/templates", auth, maybeQrTemplateMultipart, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const file = req.file;
+        const multipart = Boolean(file?.path);
+        const b = req.body || {};
+        const name = String(b.name ?? "").trim();
+        /** Plantillas QR no usan Meta HSM; el modelo conserva campos por compatibilidad. */
+        const metaTemplateName = "";
+        const languageCodeMeta = "es";
+        if (!name)
+            return res.status(400).json({ error: "El nombre es obligatorio" });
+        const contentType = String(b.contentType ?? "").toLowerCase();
+        if (contentType !== "text" && contentType !== "image")
+            return res.status(400).json({ error: "contentType debe ser text o image" });
+        const text = String(b.text ?? "").trim();
+        const caption = String(b.caption ?? "").trim();
+        const imageUrl = String(b.imageUrl ?? "").trim();
+        if (contentType === "text" && !text)
+            return res.status(400).json({ error: "El texto no puede estar vacío" });
+        if (contentType === "text" && multipart)
+            return res.status(400).json({ error: "Plantilla de texto: usá JSON (sin archivos)" });
+        if (contentType === "text") {
+            try {
+                assertMetaStyleConsecutiveTemplateVarsInText(text, "el mensaje");
+            }
+            catch (ve) {
+                const msg = ve instanceof Error ? ve.message : String(ve);
+                return res.status(400).json({ error: msg });
+            }
+            try {
+                const doc = await QrMessageTemplate.create({
+                    companyId: new Types.ObjectId(String(cid)),
+                    name,
+                    contentType,
+                    text,
+                    imageUrl: "",
+                    imageBucket: "",
+                    imageObjectKey: "",
+                    caption: "",
+                    metaTemplateName,
+                    languageCode: languageCodeMeta,
+                });
+                return res.status(201).json(enrichQr(doc.toObject()) ?? doc.toObject());
+            }
+            catch (e) {
+                console.error("[send/qr/templates POST]", e);
+                return res.status(500).json({ error: "Error al guardar plantilla" });
+            }
+        }
+        // image
+        try {
+            assertMetaStyleConsecutiveTemplateVarsInText(caption, "la leyenda");
+        }
+        catch (ve) {
+            if (file?.path)
+                void unlink(file.path).catch(() => { });
+            const msg = ve instanceof Error ? ve.message : String(ve);
+            return res.status(400).json({ error: msg });
+        }
+        if (isQrStorageEnabled() && deps.mediaServiceUrl) {
+            if (multipart && file?.path) {
+                try {
+                    const up = await uploadFileToMediaService(deps.mediaServiceUrl, deps.mediaServiceKey, file.path, String(cid), file.originalname, file.mimetype);
+                    await unlink(file.path).catch(() => { });
+                    const doc = await QrMessageTemplate.create({
+                        companyId: new Types.ObjectId(String(cid)),
+                        name,
+                        contentType: "image",
+                        text: "",
+                        imageUrl: "",
+                        imageBucket: up.bucket,
+                        imageObjectKey: up.key,
+                        caption,
+                        metaTemplateName,
+                        languageCode: languageCodeMeta,
+                    });
+                    return res.status(201).json(enrichQr(doc.toObject()) ?? doc.toObject());
+                }
+                catch (e) {
+                    if (file?.path)
+                        void unlink(file.path).catch(() => { });
+                    const msg = e instanceof Error ? e.message : "Error al subir la imagen";
+                    console.error("[send/qr/templates POST upload]", e);
+                    return res.status(502).json({ error: msg });
+                }
+            }
+            if (!multipart && imageUrl && /^https?:\/\//i.test(imageUrl)) {
+                if (file?.path)
+                    void unlink(file.path).catch(() => { });
+                const doc = await QrMessageTemplate.create({
+                    companyId: new Types.ObjectId(String(cid)),
+                    name,
+                    contentType: "image",
+                    text: "",
+                    imageUrl,
+                    imageBucket: "",
+                    imageObjectKey: "",
+                    caption,
+                    metaTemplateName,
+                    languageCode: languageCodeMeta,
+                });
+                return res.status(201).json(enrichQr(doc.toObject()) ?? doc.toObject());
+            }
+            if (file?.path)
+                void unlink(file.path).catch(() => { });
+            return res.status(400).json({
+                error: "Con almacenamiento: subí un archivo (campo image) o indicá imageUrl (https) en JSON",
+            });
+        }
+        if (!imageUrl) {
+            if (file?.path)
+                void unlink(file.path).catch(() => { });
+            return res.status(400).json({ error: "La URL de la imagen es obligatoria (o configurá almacenamiento + subida de archivo)" });
+        }
+        if (!/^https?:\/\//i.test(imageUrl)) {
+            if (file?.path)
+                void unlink(file.path).catch(() => { });
+            return res.status(400).json({ error: "imageUrl debe ser http(s)" });
+        }
+        if (file?.path)
+            void unlink(file.path).catch(() => { });
+        try {
+            const doc = await QrMessageTemplate.create({
+                companyId: new Types.ObjectId(String(cid)),
+                name,
+                contentType: "image",
+                text: "",
+                imageUrl,
+                imageBucket: "",
+                imageObjectKey: "",
+                caption,
+                metaTemplateName,
+                languageCode: languageCodeMeta,
+            });
+            return res.status(201).json(enrichQr(doc.toObject()) ?? doc.toObject());
+        }
+        catch (e) {
+            console.error("[send/qr/templates POST]", e);
+            return res.status(500).json({ error: "Error al guardar plantilla" });
+        }
+    });
+    r.put("/qr/templates/:id", auth, maybeQrTemplateMultipart, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const { id } = req.params;
+        if (!isValidObjectId(id))
+            return res.status(400).json({ error: "Id inválido" });
+        const file = req.file;
+        const multipart = Boolean(file?.path);
+        const b = req.body || {};
+        const name = String(b.name ?? "").trim();
+        const metaTemplateName = "";
+        const languageCodeMeta = "es";
+        if (!name)
+            return res.status(400).json({ error: "El nombre es obligatorio" });
+        const contentType = String(b.contentType ?? "").toLowerCase();
+        if (contentType !== "text" && contentType !== "image")
+            return res.status(400).json({ error: "contentType debe ser text o image" });
+        const text = String(b.text ?? "").trim();
+        const caption = String(b.caption ?? "").trim();
+        const imageUrl = String(b.imageUrl ?? "").trim();
+        const keepImage = b.keepImage === true || b.keepImage === 1 || String(b.keepImage ?? "") === "1" || String(b.keepImage ?? "").toLowerCase() === "true";
+        if (contentType === "text" && !text)
+            return res.status(400).json({ error: "El texto no puede estar vacío" });
+        if (contentType === "text" && multipart)
+            return res.status(400).json({ error: "Plantilla de texto: usá JSON (sin archivos)" });
+        if (contentType === "text") {
+            try {
+                assertMetaStyleConsecutiveTemplateVarsInText(text, "el mensaje");
+            }
+            catch (ve) {
+                const msg = ve instanceof Error ? ve.message : String(ve);
+                return res.status(400).json({ error: msg });
+            }
+            try {
+                const existing = await QrMessageTemplate.findOne({ _id: id, companyId: new Types.ObjectId(String(cid)) }).lean();
+                if (!existing) {
+                    if (file?.path)
+                        void unlink(file.path).catch(() => { });
+                    return res.status(404).json({ error: "Plantilla no encontrada" });
+                }
+                if (isQrStorageEnabled() && existing?.imageObjectKey) {
+                    try {
+                        await deleteObjectFromMediaService(deps.mediaServiceUrl, deps.mediaServiceKey, String(existing.imageObjectKey));
+                    }
+                    catch (e) {
+                        console.error("[send/qr/templates] delete old image on type switch", e);
+                    }
+                }
+                const doc = await QrMessageTemplate.findOneAndUpdate({ _id: id, companyId: new Types.ObjectId(String(cid)) }, {
+                    $set: {
+                        name,
+                        contentType,
+                        text,
+                        imageUrl: "",
+                        imageBucket: "",
+                        imageObjectKey: "",
+                        caption: "",
+                        metaTemplateName,
+                        languageCode: languageCodeMeta,
+                    },
+                }, { new: true }).lean();
+                if (!doc)
+                    return res.status(404).json({ error: "Plantilla no encontrada" });
+                return res.json(enrichQr(doc) ?? doc);
+            }
+            catch (e) {
+                if (file?.path)
+                    void unlink(file.path).catch(() => { });
+                console.error("[send/qr/templates/:id PUT]", e);
+                return res.status(500).json({ error: "Error al actualizar plantilla" });
+            }
+        }
+        // image
+        try {
+            assertMetaStyleConsecutiveTemplateVarsInText(caption, "la leyenda");
+        }
+        catch (ve) {
+            if (file?.path)
+                void unlink(file.path).catch(() => { });
+            const msg = ve instanceof Error ? ve.message : String(ve);
+            return res.status(400).json({ error: msg });
+        }
+        const existing = await QrMessageTemplate.findOne({ _id: id, companyId: new Types.ObjectId(String(cid)) }).lean();
+        if (!existing) {
+            if (file?.path)
+                void unlink(file.path).catch(() => { });
+            return res.status(404).json({ error: "Plantilla no encontrada" });
+        }
+        if (isQrStorageEnabled() && deps.mediaServiceUrl) {
+            if (multipart && file?.path) {
+                if (existing.imageObjectKey) {
+                    try {
+                        await deleteObjectFromMediaService(deps.mediaServiceUrl, deps.mediaServiceKey, String(existing.imageObjectKey));
+                    }
+                    catch (e) {
+                        console.error("[send/qr/templates] delete old on replace", e);
+                    }
+                }
+                try {
+                    const up = await uploadFileToMediaService(deps.mediaServiceUrl, deps.mediaServiceKey, file.path, String(cid), file.originalname, file.mimetype);
+                    await unlink(file.path).catch(() => { });
+                    const doc = await QrMessageTemplate.findOneAndUpdate({ _id: id, companyId: new Types.ObjectId(String(cid)) }, {
+                        $set: {
+                            name,
+                            contentType: "image",
+                            text: "",
+                            imageUrl: "",
+                            imageBucket: up.bucket,
+                            imageObjectKey: up.key,
+                            caption,
+                            metaTemplateName,
+                            languageCode: languageCodeMeta,
+                        },
+                    }, { new: true }).lean();
+                    if (!doc)
+                        return res.status(404).json({ error: "Plantilla no encontrada" });
+                    return res.json(enrichQr(doc) ?? doc);
+                }
+                catch (e) {
+                    if (file?.path)
+                        void unlink(file.path).catch(() => { });
+                    const msg = e instanceof Error ? e.message : "Error al subir la imagen";
+                    console.error("[send/qr/templates PUT upload]", e);
+                    return res.status(502).json({ error: msg });
+                }
+            }
+        }
+        if (keepImage && !file?.path && (existing.imageObjectKey || (existing.imageUrl && existing.imageUrl.trim()))) {
+            const doc = await QrMessageTemplate.findOneAndUpdate({ _id: id, companyId: new Types.ObjectId(String(cid)) }, {
+                $set: {
+                    name,
+                    contentType: "image",
+                    text: "",
+                    caption,
+                    metaTemplateName,
+                    languageCode: languageCodeMeta,
+                },
+            }, { new: true }).lean();
+            if (!doc)
+                return res.status(404).json({ error: "Plantilla no encontrada" });
+            return res.json(enrichQr(doc) ?? doc);
+        }
+        if (multipart && file?.path) {
+            void unlink(file.path).catch(() => { });
+            if (isQrStorageEnabled()) {
+                return res.status(400).json({ error: "Solicitud inválida" });
+            }
+            return res.status(400).json({ error: "Subida requiere configurar el microservicio de medios (MEDIA_SERVICE_*)" });
+        }
+        if (file?.path)
+            void unlink(file.path).catch(() => { });
+        const imageUrlToSave = imageUrl || String(existing.imageUrl ?? "").trim();
+        if (!imageUrlToSave)
+            return res.status(400).json({ error: "Indicá imageUrl (https) o subí imagen" });
+        if (!/^https?:\/\//i.test(imageUrlToSave))
+            return res.status(400).json({ error: "imageUrl debe ser http(s)" });
+        const doc = await QrMessageTemplate.findOneAndUpdate({ _id: id, companyId: new Types.ObjectId(String(cid)) }, {
+            $set: {
+                name,
+                contentType: "image",
+                text: "",
+                imageUrl: imageUrlToSave,
+                imageBucket: "",
+                imageObjectKey: "",
+                caption,
+                metaTemplateName,
+                languageCode: languageCodeMeta,
+            },
+        }, { new: true }).lean();
+        if (!doc)
+            return res.status(404).json({ error: "Plantilla no encontrada" });
+        return res.json(enrichQr(doc) ?? doc);
+    });
+    r.delete("/qr/templates/:id", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        const { id } = req.params;
+        if (!isValidObjectId(id))
+            return res.status(400).json({ error: "Id inválido" });
+        try {
+            const ex = await QrMessageTemplate.findOne({ _id: id, companyId: new Types.ObjectId(String(cid)) })
+                .select({ imageObjectKey: 1 })
+                .lean();
+            if (!ex)
+                return res.status(404).json({ error: "Plantilla no encontrada" });
+            if (isQrStorageEnabled() && ex.imageObjectKey) {
+                try {
+                    await deleteObjectFromMediaService(deps.mediaServiceUrl, deps.mediaServiceKey, String(ex.imageObjectKey));
+                }
+                catch (e) {
+                    console.error("[send/qr/templates DELETE] storage", e);
+                }
+            }
+            const r0 = await QrMessageTemplate.deleteOne({ _id: id, companyId: new Types.ObjectId(String(cid)) });
+            if (r0.deletedCount === 0)
+                return res.status(404).json({ error: "Plantilla no encontrada" });
+            return res.status(204).send();
+        }
+        catch (e) {
+            console.error("[send/qr/templates/:id DELETE]", e);
+            return res.status(500).json({ error: "Error al eliminar" });
+        }
+    });
+    /** --- Proxy a microservicio QR (Baileys), sin exponer el puerto al cliente --- */
+    r.post("/qr/session/start", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        if (!qrBase || !qrKey)
+            return res.status(501).json({ error: "Canal QR no configurado" });
+        try {
+            const r2 = await forwardMasssivoQr(String(cid), "/session/start", { method: "POST" });
+            const text = await r2.text();
+            return res.status(r2.status).type("json").send(text);
+        }
+        catch (e) {
+            console.error("[send/qr/session/start]", e);
+            return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+        }
+    });
+    r.post("/qr/session/logout", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        if (!qrBase || !qrKey)
+            return res.status(501).json({ error: "Canal QR no configurado" });
+        try {
+            const r2 = await forwardMasssivoQr(String(cid), "/session/logout", { method: "POST" });
+            const text = await r2.text();
+            return res.status(r2.status).type("json").send(text);
+        }
+        catch (e) {
+            console.error("[send/qr/session/logout]", e);
+            return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+        }
+    });
+    r.get("/qr/status", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        if (!qrBase || !qrKey)
+            return res.status(501).json({ error: "Canal QR no configurado" });
+        try {
+            const r2 = await forwardMasssivoQr(String(cid), "/status", { method: "GET" });
+            const text = await r2.text();
+            return res.status(r2.status).type("json").send(text);
+        }
+        catch (e) {
+            console.error("[send/qr/status]", e);
+            return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+        }
+    });
+    r.post("/qr/messages/text", auth, async (req, res) => {
+        if (!req.auth)
+            return res.status(401).json({ error: "No autenticado" });
+        const cid = req.auth.companyId;
+        if (!cid)
+            return res.status(400).json({ error: "Debes crear empresa primero" });
+        if (!qrBase || !qrKey)
+            return res.status(501).json({ error: "Canal QR no configurado" });
+        try {
+            const r2 = await forwardMasssivoQr(String(cid), "/messages/text", {
+                method: "POST",
+                body: JSON.stringify(req.body ?? {}),
+            });
+            const text = await r2.text();
+            return res.status(r2.status).type("json").send(text);
+        }
+        catch (e) {
+            console.error("[send/qr/messages/text]", e);
+            return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+        }
     });
     return r;
 }

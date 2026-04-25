@@ -29,4 +29,14 @@ export const config = {
 
   /** Formulario landing — destinatarios WhatsApp (solo dígitos, separados por comas). Ej: 573001112233,573004445556 */
   numberListWhats: opt("NumberListWhats"),
+
+  /** Microservicio masssivo-qr-wa (Baileys, solo localhost; el proxy añade JWT → companyId). */
+  masssivoQrWaUrl: opt("MASSIVO_QR_WA_URL") ?? "http://127.0.0.1:3840",
+  masssivoQrWaKey: opt("MASSIVO_QR_WA_KEY"),
+
+  /** masssivo-media (MinIO). Si faltan, las plantillas QR con imagen solo aceptan URL pública (legacy). */
+  mediaServiceUrl: opt("MEDIA_SERVICE_URL") ?? "http://127.0.0.1:3841",
+  mediaServiceKey: opt("MEDIA_SERVICE_KEY"),
+  /** Mismo prefijo que MEDIA_PUBLIC_BASE_URL en masssivo-media (URL pública de objetos, sin / final). */
+  mediaPublicBaseUrl: opt("MEDIA_PUBLIC_BASE_URL")?.replace(/\/$/, ""),
 };

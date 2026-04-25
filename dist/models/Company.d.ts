@@ -6,11 +6,13 @@ declare const companySchema: mongoose.Schema<any, mongoose.Model<any, any, any, 
     phone: string;
     nit: string;
     legalName: string;
+    outboundChannel: "cloud_api" | "qr_baileys";
 } & mongoose.DefaultTimestampProps, mongoose.Document<unknown, {}, mongoose.FlatRecord<{
     email: string;
     phone: string;
     nit: string;
     legalName: string;
+    outboundChannel: "cloud_api" | "qr_baileys";
 } & mongoose.DefaultTimestampProps>, {}, mongoose.MergeType<mongoose.DefaultSchemaOptions, {
     timestamps: true;
 }>> & mongoose.FlatRecord<{
@@ -18,6 +20,7 @@ declare const companySchema: mongoose.Schema<any, mongoose.Model<any, any, any, 
     phone: string;
     nit: string;
     legalName: string;
+    outboundChannel: "cloud_api" | "qr_baileys";
 } & mongoose.DefaultTimestampProps> & {
     _id: mongoose.Types.ObjectId;
 } & {

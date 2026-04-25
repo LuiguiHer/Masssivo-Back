@@ -16,5 +16,13 @@ export declare const config: {
     serwpSendUrl: string;
     /** Formulario landing — destinatarios WhatsApp (solo dígitos, separados por comas). Ej: 573001112233,573004445556 */
     numberListWhats: string | undefined;
+    /** Microservicio masssivo-qr-wa (Baileys, solo localhost; el proxy añade JWT → companyId). */
+    masssivoQrWaUrl: string;
+    masssivoQrWaKey: string | undefined;
+    /** masssivo-media (MinIO). Si faltan, las plantillas QR con imagen solo aceptan URL pública (legacy). */
+    mediaServiceUrl: string;
+    mediaServiceKey: string | undefined;
+    /** Mismo prefijo que MEDIA_PUBLIC_BASE_URL en masssivo-media (URL pública de objetos, sin / final). */
+    mediaPublicBaseUrl: string | undefined;
 };
 //# sourceMappingURL=config.d.ts.map

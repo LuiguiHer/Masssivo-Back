@@ -5,6 +5,7 @@ import mongoose from "mongoose";
 import { Server } from "socket.io";
 import { createApp } from "./app.js";
 import { config } from "./config.js";
+import { attachQrWaWebSocketProxy } from "./qrWaWsProxy.js";
 import { CompanyWebhookVerifyToken } from "./models/CompanyWebhookVerifyToken.js";
 import { ingestWhatsAppWebhook } from "./services/webhookIngest.js";
 let io;
@@ -30,11 +31,17 @@ const app = createApp({
     },
     sendJwtSecret: config.sendJwtSecret,
     serwpSendUrl: config.serwpSendUrl,
+    masssivoQrWaBaseUrl: config.masssivoQrWaUrl,
+    masssivoQrWaKey: config.masssivoQrWaKey,
+    mediaServiceUrl: config.mediaServiceUrl,
+    mediaServiceKey: config.mediaServiceKey,
+    mediaPublicBaseUrl: config.mediaPublicBaseUrl,
     onWebhook: (body) => {
         void ingestWhatsAppWebhook(body, io).catch((e) => console.error("[webhook ingest]", e));
     },
 });
 const httpServer = http.createServer(app);
+attachQrWaWebSocketProxy(httpServer, config.sendJwtSecret);
 io = new Server(httpServer, {
     path: "/inbox/socket.io/",
     cors: { origin: true, methods: ["GET", "POST"] },
@@ -60,6 +67,13 @@ io.use((socket, next) => {
 });
 io.on("connection", () => {
     /* dashboard conectado */
+});
+process.on("unhandledRejection", (reason) => {
+    console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+    console.error("[uncaughtException]", err);
+    process.exit(1);
 });
 async function main() {
     await mongoose.connect(config.mongodbUri);

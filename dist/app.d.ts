@@ -6,6 +6,11 @@ export type CreateAppOptions = {
     onWebhook?: (body: unknown) => void;
     sendJwtSecret: string;
     serwpSendUrl: string;
+    masssivoQrWaBaseUrl?: string;
+    masssivoQrWaKey?: string;
+    mediaServiceUrl?: string;
+    mediaServiceKey?: string;
+    mediaPublicBaseUrl?: string;
 };
 export declare function createApp(opts: CreateAppOptions): Express;
 //# sourceMappingURL=app.d.ts.map

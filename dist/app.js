@@ -16,6 +16,11 @@ export function createApp(opts) {
     app.use("/api/send", createSendApiRouter({
         jwtSecret: opts.sendJwtSecret,
         serwpSendUrl: opts.serwpSendUrl,
+        masssivoQrWaBaseUrl: opts.masssivoQrWaBaseUrl,
+        masssivoQrWaKey: opts.masssivoQrWaKey,
+        mediaServiceUrl: opts.mediaServiceUrl,
+        mediaServiceKey: opts.mediaServiceKey,
+        mediaPublicBaseUrl: opts.mediaPublicBaseUrl,
     }));
     app.use("/inbox/v1", createInboxRouter(opts.sendJwtSecret));
     app.use(createWebhookRouter(opts.webhookVerifyToken, opts.onWebhook, opts.checkWebhookVerifyToken, opts.onWebhookVerifySuccess));

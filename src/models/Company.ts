@@ -6,6 +6,12 @@ const companySchema = new mongoose.Schema(
     email: { type: String, required: true, trim: true },
     legalName: { type: String, required: true, trim: true },
     phone: { type: String, required: true, trim: true },
+    /** Salida: Cloud API (Meta) o microservicio Baileys (QR). Por defecto Meta. */
+    outboundChannel: {
+      type: String,
+      enum: ["cloud_api", "qr_baileys"],
+      default: "cloud_api",
+    },
   },
   { timestamps: true },
 );

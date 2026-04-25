@@ -12,6 +12,11 @@ export type CreateAppOptions = {
   onWebhook?: (body: unknown) => void;
   sendJwtSecret: string;
   serwpSendUrl: string;
+  masssivoQrWaBaseUrl?: string;
+  masssivoQrWaKey?: string;
+  mediaServiceUrl?: string;
+  mediaServiceKey?: string;
+  mediaPublicBaseUrl?: string;
 };
 
 export function createApp(opts: CreateAppOptions): Express {
@@ -33,6 +38,11 @@ export function createApp(opts: CreateAppOptions): Express {
     createSendApiRouter({
       jwtSecret: opts.sendJwtSecret,
       serwpSendUrl: opts.serwpSendUrl,
+      masssivoQrWaBaseUrl: opts.masssivoQrWaBaseUrl,
+      masssivoQrWaKey: opts.masssivoQrWaKey,
+      mediaServiceUrl: opts.mediaServiceUrl,
+      mediaServiceKey: opts.mediaServiceKey,
+      mediaPublicBaseUrl: opts.mediaPublicBaseUrl,
     }),
   );
 
