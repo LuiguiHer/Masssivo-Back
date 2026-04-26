@@ -18,9 +18,12 @@ export function createApp(opts) {
         serwpSendUrl: opts.serwpSendUrl,
         masssivoQrWaBaseUrl: opts.masssivoQrWaBaseUrl,
         masssivoQrWaKey: opts.masssivoQrWaKey,
+        qrInboxServiceUrl: opts.qrInboxServiceUrl,
+        qrInboxServiceKey: opts.qrInboxServiceKey,
         mediaServiceUrl: opts.mediaServiceUrl,
         mediaServiceKey: opts.mediaServiceKey,
         mediaPublicBaseUrl: opts.mediaPublicBaseUrl,
+        getIo: opts.getIo,
     }));
     app.use("/inbox/v1", createInboxRouter(opts.sendJwtSecret));
     app.use(createWebhookRouter(opts.webhookVerifyToken, opts.onWebhook, opts.checkWebhookVerifyToken, opts.onWebhookVerifySuccess));

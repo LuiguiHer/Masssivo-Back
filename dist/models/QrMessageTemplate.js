@@ -14,6 +14,10 @@ const qrMessageTemplateSchema = new mongoose.Schema({
     imageObjectKey: { type: String, trim: true, default: "" },
     /** Leyenda opcional bajo la imagen. */
     caption: { type: String, trim: true, default: "" },
+    /** Texto visible del enlace opcional (ej: "Desuscribirse"). */
+    linkLabel: { type: String, trim: true, default: "", maxlength: 120 },
+    /** URL opcional con variables {{1}}, {{2}}... para personalizar por fila. */
+    linkUrlTemplate: { type: String, trim: true, default: "", maxlength: 2000 },
     /** Nombre exacto de la plantilla HSM aprobada en Meta (Emisión / Cloud API). Si vacío, se usa `name`. */
     metaTemplateName: { type: String, trim: true, default: "", maxlength: 512 },
     /** Código de idioma Meta (p. ej. es, es_MX). */

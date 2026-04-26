@@ -8,6 +8,7 @@ import path from "node:path";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import { isValidObjectId, Types } from "mongoose";
+import type { Server } from "socket.io";
 import { Chat } from "../models/Chat.js";
 import { Client } from "../models/Client.js";
 import { Company } from "../models/Company.js";
@@ -60,10 +61,13 @@ type SendApiDeps = {
   /** Opcional: proxy a masssivo-qr-wa (mismas claves en MASSIVO_QR_WA_KEY que INTERNAL del microservicio). */
   masssivoQrWaBaseUrl?: string;
   masssivoQrWaKey?: string;
+  qrInboxServiceUrl?: string;
+  qrInboxServiceKey?: string;
   /** masssivo-media (MinIO) — opcional; si falta, plantilla imagen solo por URL. */
   mediaServiceUrl?: string;
   mediaServiceKey?: string;
   mediaPublicBaseUrl?: string;
+  getIo?: () => Server | undefined;
 };
 
 async function deliverOtpCode(deps: SendApiDeps, whatsappDigits: string, code: string, mode: "login" | "register"): Promise<void> {
@@ -211,7 +215,8 @@ function resolveOutboundChannel(company: LeanCompany | null | undefined): "cloud
 export function createSendApiRouter(deps: SendApiDeps): Router {
   const r = Router();
   const auth = requireAuth(deps.jwtSecret);
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+  /** Subidas para media de plantillas Meta (resumable): videos suelen superar 15MB. */
+  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
   const qrTemplateDisk = multer({
     storage: multer.diskStorage({
       destination: (_req, _f, cb) => cb(null, os.tmpdir()),
@@ -267,11 +272,79 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
 
   const qrBase = deps.masssivoQrWaBaseUrl?.replace(/\/$/, "");
   const qrKey = deps.masssivoQrWaKey;
+  const qrInboxServiceBase = String(deps.qrInboxServiceUrl ?? "").replace(/\/$/, "");
+  const qrInboxServiceKey = String(deps.qrInboxServiceKey ?? "");
   const forwardMasssivoQr = (companyId: string, subPath: string, init: RequestInit) => {
     const url = `${qrBase}/v1/tenants/${encodeURIComponent(companyId)}${subPath}`;
     const h: Record<string, string> = { "X-Internal-Key": qrKey as string };
     if (init.body != null) h["Content-Type"] = "application/json";
     return fetch(url, { method: init.method ?? "GET", body: init.body, headers: h });
+  };
+
+  /** Histórico + tiempo real: el tab QR lee `qr-inbox-service`, no `Message`/`Chat` de Cloud. */
+  const persistQrOutboundAndNotify = async (params: {
+    companyId: string;
+    waId: string;
+    wamid: string;
+    type: string;
+    bodyText?: string;
+    payload: unknown;
+    now: Date;
+    displayName?: string;
+    peerJid?: string;
+  }): Promise<void> => {
+    if (!qrInboxServiceBase || !qrInboxServiceKey) {
+      throw new Error("QR inbox no configurado (QR_INBOX_SERVICE_URL / KEY)");
+    }
+    const { companyId, waId, wamid, type, bodyText, payload, now, displayName, peerJid: peerJidPersist } = params;
+    const preview = bodyText?.trim() || (type === "image" ? "[imagen]" : `[${type}]`);
+    const r = await fetch(`${qrInboxServiceBase}/internal/outbound`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-internal-key": qrInboxServiceKey },
+      body: JSON.stringify({
+        companyId,
+        waId,
+        wamid,
+        type,
+        bodyText: bodyText ?? undefined,
+        payload,
+        timestamp: now.toISOString(),
+        peerJid: peerJidPersist,
+      }),
+    });
+    const raw = await r.text();
+    if (!r.ok) {
+      console.error("[send] persistQrOutbound", r.status, raw);
+      throw new Error("No se pudo guardar el mensaje en el historial QR");
+    }
+    type OutResp = { inserted?: boolean; message?: Record<string, unknown> };
+    let data: OutResp = {};
+    try {
+      data = raw ? (JSON.parse(raw) as OutResp) : {};
+    } catch {
+      data = {};
+    }
+    if (!data.inserted) return;
+    const room = `company:${companyId}`;
+    const msg = (data.message ?? {
+      wamid,
+      direction: "out",
+      type,
+      bodyText,
+      preview,
+      timestamp: now.toISOString(),
+    }) as Record<string, unknown>;
+    const io = deps.getIo?.();
+    io?.to(room).emit("message:new", { channel: "qr_baileys" as const, waId, message: msg });
+    io?.to(room).emit("chat:updated", {
+      channel: "qr_baileys" as const,
+      waId,
+      displayName: displayName || undefined,
+      peerJid: peerJidPersist,
+      lastMessagePreview: String(msg.preview ?? preview),
+      lastMessageAt: String(msg.timestamp ?? now.toISOString()),
+      unreadCountDelta: 0,
+    });
   };
 
   /** Sin auth: Meta y otros clientes deben poder GET por HTTPS el archivo de muestra. */
@@ -308,6 +381,106 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     } catch (e) {
       console.error("[public/landing-contact]", e);
       return res.status(500).json({ error: "No se pudo registrar la solicitud. Intenta de nuevo o escríbenos por WhatsApp." });
+    }
+  });
+
+  /** Ingesta interna de mensajes entrantes desde masssivo-qr-wa (Baileys). */
+  r.post("/internal/qr/inbound", async (req, res) => {
+    try {
+      const key = String(req.header("x-internal-key") ?? "").trim();
+      if (!qrKey || key !== String(qrKey)) {
+        return res.status(401).json({ error: "No autorizado" });
+      }
+      const qrInboxUrl = String(deps.qrInboxServiceUrl ?? "").trim();
+      const qrInboxKey = String(deps.qrInboxServiceKey ?? "").trim();
+      if (!qrInboxUrl || !qrInboxKey) {
+        return res.status(500).json({ error: "Servicio QR inbox no configurado" });
+      }
+      const body = (req.body ?? {}) as {
+        companyId?: string;
+        waId?: string;
+        peerJid?: string;
+        wamid?: string;
+        type?: string;
+        bodyText?: string;
+        payload?: unknown;
+        profileName?: string;
+        timestamp?: string | number;
+      };
+      const companyId = String(body.companyId ?? "").trim();
+      const waId = String(body.waId ?? "").trim();
+      const wamid = String(body.wamid ?? "").trim();
+      const type = String(body.type ?? "unknown").trim() || "unknown";
+      if (!companyId || !isValidObjectId(companyId)) {
+        return res.status(400).json({ error: "companyId inválido" });
+      }
+      if (!waId || !wamid) {
+        return res.status(400).json({ error: "waId y wamid son obligatorios" });
+      }
+      const tsRaw = body.timestamp;
+      const parsedTs =
+        typeof tsRaw === "number" || typeof tsRaw === "string" ? new Date(tsRaw) : new Date();
+      const timestamp = Number.isNaN(parsedTs.getTime()) ? new Date() : parsedTs;
+      const fr = await fetch(`${qrInboxUrl.replace(/\/$/, "")}/internal/inbound`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-internal-key": qrInboxKey },
+        body: JSON.stringify({
+          companyId,
+          waId,
+          wamid,
+          type,
+          bodyText: typeof body.bodyText === "string" ? body.bodyText : undefined,
+          payload: body.payload,
+          profileName: typeof body.profileName === "string" ? body.profileName : undefined,
+          peerJid: typeof body.peerJid === "string" ? body.peerJid : undefined,
+          timestamp: timestamp.toISOString(),
+        }),
+      });
+      const raw = await fr.text();
+      let data: unknown = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        data = { raw };
+      }
+      if (!fr.ok) return res.status(fr.status).json(data ?? { error: "qr inbox forward failed" });
+
+      const d = (data ?? {}) as {
+        inserted?: boolean;
+        waId?: string;
+        channel?: string;
+        message?: Record<string, unknown>;
+      };
+      if (d.inserted) {
+        const io = deps.getIo?.();
+        const room = `company:${companyId}`;
+        io?.to(room).emit("message:new", {
+          channel: "qr_baileys",
+          waId: String(d.waId ?? waId),
+          message: d.message ?? {
+            wamid,
+            direction: "in",
+            type,
+            bodyText: typeof body.bodyText === "string" ? body.bodyText : undefined,
+            preview: typeof body.bodyText === "string" ? body.bodyText : `[${type}]`,
+            timestamp: timestamp.toISOString(),
+          },
+        });
+        io?.to(room).emit("chat:updated", {
+          channel: "qr_baileys",
+          waId: String(d.waId ?? waId),
+          displayName: typeof body.profileName === "string" ? body.profileName : undefined,
+          peerJid: typeof body.peerJid === "string" ? body.peerJid : undefined,
+          lastMessagePreview:
+            (typeof body.bodyText === "string" && body.bodyText.trim()) || `[${type}]`,
+          lastMessageAt: timestamp.toISOString(),
+          unreadCountDelta: 1,
+        });
+      }
+
+      return res.json({ ok: true, inserted: Boolean(d.inserted) });
+    } catch (e) {
+      return res.status(500).json({ error: e instanceof Error ? e.message : "No se pudo ingerir inbound QR" });
     }
   });
 
@@ -1182,7 +1355,11 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     const to = canonicalWaId(normalizeDigits(b.to ?? ""));
     const text = String(b.text ?? "").trim();
     const displayName = String(b.displayName ?? "").trim();
+    const peerJid = String((b as { peerJid?: string }).peerJid ?? "").trim();
     if (!to || !text) return res.status(400).json({ error: "to y text son obligatorios" });
+    if (resolveOutboundChannel(company) === "qr_baileys" && (!to || to.length < 8) && !peerJid) {
+      return res.status(400).json({ error: "Falta peerJid (JID del chat) o un número de teléfono válido" });
+    }
 
     if (resolveOutboundChannel(company) === "qr_baileys") {
       if (!qrBase || !qrKey) {
@@ -1192,7 +1369,7 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
       try {
         r2 = await forwardMasssivoQr(String(u.companyId), "/messages/text", {
           method: "POST",
-          body: JSON.stringify({ to, text }),
+          body: JSON.stringify({ to, text, ...(peerJid ? { peerJid } : {}) }),
         });
       } catch (e) {
         console.error("[send/messages/text qr]", e);
@@ -1210,35 +1387,26 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
       }
       const wamid = `qr-out-${new Types.ObjectId().toString()}`;
       const now = new Date();
-      const payload = { channel: "qr_baileys", to, type: "text", text: { body: text } };
-      await Message.findOneAndUpdate(
-        { companyId: u.companyId, wamid },
-        {
-          $setOnInsert: {
-            companyId: u.companyId,
-            waId: to,
-            wamid,
-            direction: "out",
-            type: "text",
-            bodyText: text,
-            payload,
-            timestamp: now,
-          },
-        },
-        { upsert: true },
-      );
-      await Chat.findOneAndUpdate(
-        { companyId: u.companyId, waId: to },
-        {
-          $set: {
-            lastMessageAt: now,
-            lastMessagePreview: text,
-            ...(displayName ? { displayName } : {}),
-          },
-          $setOnInsert: { companyId: u.companyId, waId: to },
-        },
-        { upsert: true },
-      );
+      const payload = { channel: "qr_baileys", to, type: "text", text: { body: text }, peerJid: peerJid || undefined };
+      try {
+        await persistQrOutboundAndNotify({
+          companyId: String(u.companyId),
+          waId: to,
+          wamid,
+          type: "text",
+          bodyText: text,
+          payload,
+          now,
+          displayName: displayName || undefined,
+          peerJid: peerJid || undefined,
+        });
+      } catch (e) {
+        console.error("[qr-wa] send text: WA ok pero falló persistir en QR inbox", e);
+        return res.status(500).json({
+          error:
+            "El mensaje pudo salir por WhatsApp, pero no se guardó en el historial QR. Revisa el servicio qr-inbox y vuelve a intentar.",
+        });
+      }
       console.info(
         "[qr-wa] send text ok",
         JSON.stringify({ companyId: String(u.companyId), to, wamid, synthetic: true }, null, 0),
@@ -1325,6 +1493,176 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     return res.json(data);
   });
 
+  /** Línea de salida explícita por Baileys (QR), independiente del canal por defecto de la empresa. */
+  r.post("/messages/baileys/text", auth, async (req: AuthedRequest, res) => {
+    if (!req.auth) return res.status(401).json({ error: "No autenticado" });
+    const u = await User.findById(req.auth.userId).lean<LeanUser>();
+    if (!u?.companyId) return res.status(400).json({ error: "Debes crear empresa primero" });
+    const b = req.body ?? {};
+    const to = canonicalWaId(normalizeDigits(b.to ?? ""));
+    const text = String(b.text ?? "").trim();
+    const displayName = String(b.displayName ?? "").trim();
+    const peerJid = String((b as { peerJid?: string }).peerJid ?? "").trim();
+    if (!text) return res.status(400).json({ error: "text es obligatorio" });
+    if ((!to || to.length < 8) && !peerJid) {
+      return res.status(400).json({ error: "Falta peerJid (JID del chat) o un número de teléfono válido" });
+    }
+    if (!qrBase || !qrKey) {
+      return res.status(503).json({ error: "Canal QR no disponible (servicio no configurado en el API)" });
+    }
+
+    let r2: Response;
+    try {
+      r2 = await forwardMasssivoQr(String(u.companyId), "/messages/text", {
+        method: "POST",
+        body: JSON.stringify({ to, text, ...(peerJid ? { peerJid } : {}) }),
+      });
+    } catch (e) {
+      console.error("[send/messages/baileys/text]", e);
+      return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+    }
+    const rawQ = await r2.text();
+    if (!r2.ok) {
+      let detail: unknown = rawQ;
+      try {
+        detail = rawQ ? JSON.parse(rawQ) : null;
+      } catch {
+        /* use rawQ */
+      }
+      return res.status(r2.status).json({ error: "Envío por Baileys fallido", detail });
+    }
+
+    const wamid = `qr-out-${new Types.ObjectId().toString()}`;
+    const now = new Date();
+    const payload = { channel: "qr_baileys", to, type: "text", text: { body: text }, peerJid: peerJid || undefined };
+    try {
+      await persistQrOutboundAndNotify({
+        companyId: String(u.companyId),
+        waId: to,
+        wamid,
+        type: "text",
+        bodyText: text,
+        payload,
+        now,
+        displayName: displayName || undefined,
+        peerJid: peerJid || undefined,
+      });
+    } catch (e) {
+      console.error("[qr-wa] send baileys text: WA ok pero falló persistir en QR inbox", e);
+      return res.status(500).json({
+        error:
+          "El mensaje pudo salir por WhatsApp, pero no se guardó en el historial QR. Revisa el servicio qr-inbox y vuelve a intentar.",
+      });
+    }
+    console.info(
+      "[qr-wa] send baileys text ok",
+      JSON.stringify({ companyId: String(u.companyId), to, wamid, synthetic: true }, null, 0),
+    );
+    return res.json({ messaging_product: "whatsapp", channel: "qr_baileys", messages: [{ id: wamid }] });
+  });
+
+  /** Línea de salida explícita Baileys para imagen/video/archivo vía multipart. */
+  r.post("/messages/baileys/media", auth, upload.single("file"), async (req: AuthedRequest, res) => {
+    if (!req.auth) return res.status(401).json({ error: "No autenticado" });
+    const u = await User.findById(req.auth.userId).lean<LeanUser>();
+    if (!u?.companyId) return res.status(400).json({ error: "Debes crear empresa primero" });
+    if (!qrBase || !qrKey) {
+      return res.status(503).json({ error: "Canal QR no disponible (servicio no configurado en el API)" });
+    }
+    const file = req.file;
+    if (!file?.buffer?.length) return res.status(400).json({ error: "file es obligatorio" });
+    const to = canonicalWaId(normalizeDigits(req.body?.to ?? ""));
+    const peerJid = String(req.body?.peerJid ?? "").trim();
+    const caption = String(req.body?.caption ?? "").trim();
+    const displayName = String(req.body?.displayName ?? "").trim();
+    const forcedKind = String(req.body?.mediaKind ?? "").trim().toLowerCase();
+    if ((!to || to.length < 8) && !peerJid) {
+      return res.status(400).json({ error: "Falta peerJid (JID del chat) o un número de teléfono válido" });
+    }
+    const mediaKind: "image" | "video" | "document" =
+      forcedKind === "image" || forcedKind === "video" || forcedKind === "document"
+        ? forcedKind
+        : file.mimetype.startsWith("image/")
+          ? "image"
+          : file.mimetype.startsWith("video/")
+            ? "video"
+            : "document";
+
+    const fd = new FormData();
+    fd.append("to", to);
+    if (peerJid) fd.append("peerJid", peerJid);
+    if (caption) fd.append("caption", caption);
+    fd.append("mediaKind", mediaKind);
+    fd.append("fileName", file.originalname || "archivo");
+    fd.append(
+      "file",
+      new Blob([new Uint8Array(file.buffer)], { type: file.mimetype || "application/octet-stream" }),
+      file.originalname || "archivo",
+    );
+    const url = `${qrBase}/v1/tenants/${encodeURIComponent(String(u.companyId))}/messages/media`;
+    let r2: Response;
+    try {
+      r2 = await fetch(url, { method: "POST", headers: { "X-Internal-Key": String(qrKey) }, body: fd });
+    } catch (e) {
+      console.error("[send/messages/baileys/media]", e);
+      return res.status(500).json({ error: "Error al conectar con el servicio QR" });
+    }
+    const rawQ = await r2.text();
+    if (!r2.ok) {
+      let detail: unknown = rawQ;
+      try {
+        detail = rawQ ? JSON.parse(rawQ) : null;
+      } catch {
+        /* use rawQ */
+      }
+      return res.status(r2.status).json({ error: "Envío multimedia por Baileys fallido", detail });
+    }
+
+    const wamid = `qr-out-${new Types.ObjectId().toString()}`;
+    const now = new Date();
+    const preview =
+      caption ||
+      (mediaKind === "image" ? "[imagen]" : mediaKind === "video" ? "[video]" : `[archivo] ${file.originalname || ""}`.trim());
+    const payload = {
+      channel: "qr_baileys",
+      to,
+      type: mediaKind,
+      caption: caption || undefined,
+      fileName: file.originalname || undefined,
+      mimeType: file.mimetype || undefined,
+      mediaDownload: {
+        inlineBase64: file.buffer.toString("base64"),
+        mimeType: file.mimetype || "application/octet-stream",
+        fileName: file.originalname || undefined,
+      },
+      peerJid: peerJid || undefined,
+    };
+    try {
+      await persistQrOutboundAndNotify({
+        companyId: String(u.companyId),
+        waId: to,
+        wamid,
+        type: mediaKind,
+        bodyText: preview,
+        payload,
+        now,
+        displayName: displayName || undefined,
+        peerJid: peerJid || undefined,
+      });
+    } catch (e) {
+      console.error("[qr-wa] send baileys media: WA ok pero falló persistir en QR inbox", e);
+      return res.status(500).json({
+        error:
+          "El mensaje pudo salir por WhatsApp, pero no se guardó en el historial QR. Revisa el servicio qr-inbox y vuelve a intentar.",
+      });
+    }
+    console.info(
+      "[qr-wa] send baileys media ok",
+      JSON.stringify({ companyId: String(u.companyId), to, wamid, mediaKind, synthetic: true }, null, 0),
+    );
+    return res.json({ messaging_product: "whatsapp", channel: "qr_baileys", messages: [{ id: wamid }] });
+  });
+
   /** Imagen por URL + leyenda opcional; solo canal WhatsApp Web (QR) → masssivo-qr-wa. */
   r.post("/messages/qr-image", auth, async (req: AuthedRequest, res) => {
     if (!req.auth) return res.status(401).json({ error: "No autenticado" });
@@ -1341,16 +1679,25 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     }
     const b = req.body ?? {};
     const to = canonicalWaId(normalizeDigits((b as { to?: string }).to ?? ""));
+    const peerJid = String((b as { peerJid?: string }).peerJid ?? "").trim();
     const imageUrl = String((b as { imageUrl?: string }).imageUrl ?? "").trim();
     const caption = String((b as { caption?: string }).caption ?? "").trim();
     const displayName = String((b as { displayName?: string }).displayName ?? "").trim();
-    if (!to || !imageUrl) return res.status(400).json({ error: "to e imageUrl son obligatorios" });
+    if ((!to || to.length < 8) && !peerJid) {
+      return res.status(400).json({ error: "to inválido o falta peerJid" });
+    }
+    if (!imageUrl) return res.status(400).json({ error: "to e imageUrl son obligatorios" });
     if (!/^https?:\/\//i.test(imageUrl)) return res.status(400).json({ error: "imageUrl debe ser http(s)" });
     let r2: Response;
     try {
       r2 = await forwardMasssivoQr(String(u.companyId), "/messages/image-url", {
         method: "POST",
-        body: JSON.stringify({ to, imageUrl, ...(caption ? { caption } : {}) }),
+        body: JSON.stringify({
+          to,
+          imageUrl,
+          ...(caption ? { caption } : {}),
+          ...(peerJid ? { peerJid } : {}),
+        }),
       });
     } catch (e) {
       console.error("[send/messages/qr-image]", e);
@@ -1369,35 +1716,33 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     const wamid = `qr-out-${new Types.ObjectId().toString()}`;
     const now = new Date();
     const preview = caption || "[imagen]";
-    const payload = { channel: "qr_baileys", to, type: "image", imageUrl, caption: caption || undefined };
-    await Message.findOneAndUpdate(
-      { companyId: u.companyId, wamid },
-      {
-        $setOnInsert: {
-          companyId: u.companyId,
-          waId: to,
-          wamid,
-          direction: "out",
-          type: "image",
-          bodyText: preview,
-          payload,
-          timestamp: now,
-        },
-      },
-      { upsert: true },
-    );
-    await Chat.findOneAndUpdate(
-      { companyId: u.companyId, waId: to },
-      {
-        $set: {
-          lastMessageAt: now,
-          lastMessagePreview: preview,
-          ...(displayName ? { displayName } : {}),
-        },
-        $setOnInsert: { companyId: u.companyId, waId: to },
-      },
-      { upsert: true },
-    );
+    const payload = {
+      channel: "qr_baileys",
+      to,
+      type: "image",
+      imageUrl,
+      caption: caption || undefined,
+      peerJid: peerJid || undefined,
+    };
+    try {
+      await persistQrOutboundAndNotify({
+        companyId: String(u.companyId),
+        waId: to,
+        wamid,
+        type: "image",
+        bodyText: preview,
+        payload,
+        now,
+        displayName: displayName || undefined,
+        peerJid: peerJid || undefined,
+      });
+    } catch (e) {
+      console.error("[qr-wa] send image-url: WA ok pero falló persistir en QR inbox", e);
+      return res.status(500).json({
+        error:
+          "El mensaje pudo salir por WhatsApp, pero no se guardó en el historial QR. Revisa el servicio qr-inbox y vuelve a intentar.",
+      });
+    }
     console.info("[qr-wa] send image-url ok", JSON.stringify({ companyId: String(u.companyId), to, wamid, synthetic: true }, null, 0));
     return res.json({ messaging_product: "whatsapp", channel: "qr_baileys", messages: [{ id: wamid }] });
   });
@@ -1966,6 +2311,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     const text = String(b.text ?? "").trim();
     const caption = String(b.caption ?? "").trim();
     const imageUrl = String(b.imageUrl ?? "").trim();
+    const linkLabel = String(b.linkLabel ?? "").trim();
+    const linkUrlTemplate = String(b.linkUrlTemplate ?? "").trim();
     if (contentType === "text" && !text) return res.status(400).json({ error: "El texto no puede estar vacío" });
     if (contentType === "text" && multipart) return res.status(400).json({ error: "Plantilla de texto: usá JSON (sin archivos)" });
     if (contentType === "text") {
@@ -1985,6 +2332,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
           imageBucket: "",
           imageObjectKey: "",
           caption: "",
+          linkLabel,
+          linkUrlTemplate,
           metaTemplateName,
           languageCode: languageCodeMeta,
         });
@@ -2024,6 +2373,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
             imageBucket: up.bucket,
             imageObjectKey: up.key,
             caption,
+            linkLabel,
+            linkUrlTemplate,
             metaTemplateName,
             languageCode: languageCodeMeta,
           });
@@ -2046,6 +2397,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
           imageBucket: "",
           imageObjectKey: "",
           caption,
+          linkLabel,
+          linkUrlTemplate,
           metaTemplateName,
           languageCode: languageCodeMeta,
         });
@@ -2075,6 +2428,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
         imageBucket: "",
         imageObjectKey: "",
         caption,
+        linkLabel,
+        linkUrlTemplate,
         metaTemplateName,
         languageCode: languageCodeMeta,
       });
@@ -2104,6 +2459,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     const text = String(b.text ?? "").trim();
     const caption = String(b.caption ?? "").trim();
     const imageUrl = String(b.imageUrl ?? "").trim();
+    const linkLabel = String(b.linkLabel ?? "").trim();
+    const linkUrlTemplate = String(b.linkUrlTemplate ?? "").trim();
     const keepImage =
       b.keepImage === true || b.keepImage === 1 || String(b.keepImage ?? "") === "1" || String(b.keepImage ?? "").toLowerCase() === "true";
     if (contentType === "text" && !text) return res.status(400).json({ error: "El texto no puede estar vacío" });
@@ -2141,6 +2498,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
               imageBucket: "",
               imageObjectKey: "",
               caption: "",
+              linkLabel,
+              linkUrlTemplate,
               metaTemplateName,
               languageCode: languageCodeMeta,
             },
@@ -2202,6 +2561,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
                 imageBucket: up.bucket,
                 imageObjectKey: up.key,
                 caption,
+                linkLabel,
+                linkUrlTemplate,
                 metaTemplateName,
                 languageCode: languageCodeMeta,
               },
@@ -2227,6 +2588,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
             contentType: "image",
             text: "",
             caption,
+            linkLabel,
+            linkUrlTemplate,
             metaTemplateName,
             languageCode: languageCodeMeta,
           },
@@ -2258,6 +2621,8 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
           imageBucket: "",
           imageObjectKey: "",
           caption,
+          linkLabel,
+          linkUrlTemplate,
           metaTemplateName,
           languageCode: languageCodeMeta,
         },
@@ -2347,11 +2712,34 @@ export function createSendApiRouter(deps: SendApiDeps): Router {
     if (!cid) return res.status(400).json({ error: "Debes crear empresa primero" });
     if (!qrBase || !qrKey) return res.status(501).json({ error: "Canal QR no configurado" });
     try {
+      const b = (req.body ?? {}) as { to?: string; text?: string; peerJid?: string };
+      const to = canonicalWaId(normalizeDigits(b.to ?? ""));
+      const t = String(b.text ?? "").trim();
+      const pjid = String(b.peerJid ?? "").trim();
       const r2 = await forwardMasssivoQr(String(cid), "/messages/text", {
         method: "POST",
         body: JSON.stringify(req.body ?? {}),
       });
       const text = await r2.text();
+      if (r2.ok && t && (to || pjid)) {
+        const wamid = `qr-out-${new Types.ObjectId().toString()}`;
+        const now = new Date();
+        const payload = { channel: "qr_baileys", to, type: "text", text: { body: t }, peerJid: pjid || undefined };
+        try {
+          await persistQrOutboundAndNotify({
+            companyId: String(cid),
+            waId: to,
+            wamid,
+            type: "text",
+            bodyText: t,
+            payload,
+            now,
+            peerJid: pjid || undefined,
+          });
+        } catch (e) {
+          console.error("[send/qr/messages/text] envío ok pero no se guardó en QR inbox", e);
+        }
+      }
       return res.status(r2.status).type("json").send(text);
     } catch (e) {
       console.error("[send/qr/messages/text]", e);

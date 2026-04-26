@@ -4,40 +4,115 @@ import { Client } from "../models/Client.js";
 import { CompanyWhatsappConfig } from "../models/CompanyWhatsappConfig.js";
 import { CompanyWebhookVerifyToken } from "../models/CompanyWebhookVerifyToken.js";
 import { Message } from "../models/Message.js";
+import { getQrInboxModels } from "../models/qrInboxStore.js";
 import { syncMassCampaignRowFromWebhook } from "./massCampaignDelivery.js";
 import { canonicalWaId, waIdAliases } from "./waId.js";
 import { takeLiveTestIfActive } from "./webhookTestSession.js";
-function previewFromMessage(m) {
-    const t = m.type ?? "unknown";
-    if (t === "text" && m.text?.body)
-        return m.text.body;
-    if (m.image?.caption)
-        return m.image.caption;
-    if (m.video?.caption)
-        return m.video.caption;
-    if (t === "image")
-        return "[Imagen]";
-    if (t === "video")
-        return "[Video]";
-    if (t === "audio")
-        return "[Audio]";
-    if (t === "document")
-        return m.document?.filename ? `📄 ${m.document.filename}` : "[Documento]";
-    if (t === "sticker")
-        return "[Sticker]";
-    if (t === "location")
-        return "[Ubicación]";
-    if (t === "contacts")
-        return "[Contacto]";
-    if (t === "button" && m.button?.text)
-        return m.button.text;
-    if (t === "interactive")
-        return "[Interactivo]";
-    return `[${t}]`;
-}
 function extractProfileName(value, waId) {
     const c = value.contacts?.find((x) => x.wa_id === waId || x.wa_id === waId.replace(/\D/g, ""));
     return c?.profile?.name;
+}
+function extractSocketMediaFromPayload(payload) {
+    if (!payload || typeof payload !== "object")
+        return {};
+    const p = payload;
+    const md = p.mediaDownload && typeof p.mediaDownload === "object" ? p.mediaDownload : null;
+    const inlineBase64 = typeof md?.inlineBase64 === "string" ? md.inlineBase64 : "";
+    const msg = p.message && typeof p.message === "object" ? p.message : null;
+    const imageMsg = msg?.imageMessage && typeof msg.imageMessage === "object" ? msg.imageMessage : null;
+    const videoMsg = msg?.videoMessage && typeof msg.videoMessage === "object" ? msg.videoMessage : null;
+    const docMsg = msg?.documentMessage && typeof msg.documentMessage === "object" ? msg.documentMessage : null;
+    const audioMsg = msg?.audioMessage && typeof msg.audioMessage === "object" ? msg.audioMessage : null;
+    const mimeType = (typeof md?.mimeType === "string" ? md.mimeType : undefined) ??
+        (typeof imageMsg?.mimetype === "string" ? imageMsg.mimetype : undefined) ??
+        (typeof videoMsg?.mimetype === "string" ? videoMsg.mimetype : undefined) ??
+        (typeof docMsg?.mimetype === "string" ? docMsg.mimetype : undefined) ??
+        (typeof audioMsg?.mimetype === "string" ? audioMsg.mimetype : undefined);
+    const mediaDataUrl = inlineBase64 && mimeType ? `data:${mimeType};base64,${inlineBase64}` : undefined;
+    const mediaId = (typeof imageMsg?.id === "string" ? imageMsg.id : undefined) ??
+        (typeof videoMsg?.id === "string" ? videoMsg.id : undefined) ??
+        (typeof docMsg?.id === "string" ? docMsg.id : undefined) ??
+        (typeof audioMsg?.id === "string" ? audioMsg.id : undefined);
+    const fileName = (typeof docMsg?.fileName === "string" ? docMsg.fileName : undefined) ??
+        (typeof docMsg?.title === "string" ? docMsg.title : undefined);
+    return { mediaId, mediaDataUrl, mimeType, fileName };
+}
+/**
+ * Inserta un mensaje entrante en inbox de forma idempotente y notifica por websocket.
+ * Retorna `true` si se creó un mensaje nuevo, `false` si era duplicado.
+ */
+export async function ingestInboundInboxMessage(input, io) {
+    const from = canonicalWaId(input.waId);
+    const wamid = String(input.wamid ?? "").trim();
+    if (!from || !wamid)
+        return false;
+    const timestamp = input.timestamp instanceof Date && !Number.isNaN(input.timestamp.getTime()) ? input.timestamp : new Date();
+    const bodyText = input.bodyText ? String(input.bodyText) : undefined;
+    const preview = bodyText?.trim() || `[${String(input.type || "unknown")}]`;
+    const companyId = input.companyId;
+    const source = input.source === "qr" ? "qr" : "cloud";
+    const channel = source === "qr" ? "qr_baileys" : "cloud_api";
+    const companyRoom = `company:${String(companyId)}`;
+    const { QrChat, QrMessage } = getQrInboxModels();
+    const ChatModel = source === "qr" ? QrChat : Chat;
+    const MessageModel = source === "qr" ? QrMessage : Message;
+    const client = await Client.findOne({ companyId, phone: { $in: waIdAliases(from) } }).select({ name: 1 }).lean();
+    const preferredDisplayName = String(client?.name ?? "").trim() || String(input.profileName ?? "").trim();
+    const messageUpsert = await MessageModel.updateOne({ companyId, wamid }, {
+        $setOnInsert: {
+            companyId,
+            waId: from,
+            wamid,
+            direction: "in",
+            type: String(input.type || "unknown"),
+            bodyText,
+            payload: input.payload,
+            timestamp,
+        },
+    }, { upsert: true });
+    const isNewMessage = Boolean(messageUpsert.upsertedCount);
+    if (!isNewMessage)
+        return false;
+    await ChatModel.findOneAndUpdate({ companyId, waId: from }, {
+        $set: {
+            lastMessageAt: timestamp,
+            lastMessagePreview: preview,
+            ...(preferredDisplayName ? { displayName: preferredDisplayName } : {}),
+        },
+        $inc: { unreadCount: 1 },
+        $setOnInsert: { companyId, waId: from },
+    }, { upsert: true });
+    io?.to(companyRoom).emit("message:new", {
+        channel,
+        waId: from,
+        message: {
+            wamid,
+            direction: "in",
+            type: String(input.type || "unknown"),
+            bodyText,
+            preview,
+            timestamp: timestamp.toISOString(),
+            ...extractSocketMediaFromPayload(input.payload),
+        },
+    });
+    io?.to(companyRoom).emit("chat:updated", {
+        channel,
+        waId: from,
+        displayName: preferredDisplayName,
+        lastMessagePreview: preview,
+        lastMessageAt: timestamp.toISOString(),
+        unreadCountDelta: 1,
+    });
+    if (takeLiveTestIfActive(String(companyId))) {
+        const now = new Date();
+        await CompanyWebhookVerifyToken.updateOne({ companyId }, { $set: { liveTestPassedAt: now } });
+        io?.to(companyRoom).emit("webhook:live-test:success", {
+            ok: true,
+            message: "Tu conexión al webhook se estableció correctamente.",
+            passedAt: now.toISOString(),
+        });
+    }
+    return true;
 }
 /**
  * Estados de entrega que envía Meta en `value.statuses` (sent → delivered → read, o failed).
@@ -146,61 +221,19 @@ export async function ingestWhatsAppWebhook(body, io) {
                     const tsSec = Number(m.timestamp);
                     const timestamp = Number.isFinite(tsSec) ? new Date(tsSec * 1000) : new Date();
                     const bodyText = m.type === "text" ? m.text?.body : undefined;
-                    const preview = previewFromMessage(m);
                     const displayName = extractProfileName(value, m.from ?? "") ?? extractProfileName(value, from);
-                    const client = await Client.findOne({ companyId, phone: { $in: waIdAliases(from) } }).select({ name: 1 }).lean();
-                    const preferredDisplayName = String(client?.name ?? "").trim() || displayName;
-                    const messageUpsert = await Message.updateOne({ companyId, wamid: m.id }, {
-                        $setOnInsert: {
-                            companyId,
-                            waId: from,
-                            wamid: m.id,
-                            direction: "in",
-                            type: m.type ?? "unknown",
-                            bodyText,
-                            payload: m,
-                            timestamp,
-                        },
-                    }, { upsert: true });
-                    const isNewMessage = Boolean(messageUpsert.upsertedCount);
+                    const isNewMessage = await ingestInboundInboxMessage({
+                        companyId,
+                        waId: from,
+                        wamid: String(m.id ?? ""),
+                        timestamp,
+                        type: m.type ?? "unknown",
+                        bodyText,
+                        payload: m,
+                        profileName: displayName,
+                    }, io);
                     if (!isNewMessage)
                         continue;
-                    await Chat.findOneAndUpdate({ companyId, waId: from }, {
-                        $set: {
-                            lastMessageAt: timestamp,
-                            lastMessagePreview: preview,
-                            ...(preferredDisplayName ? { displayName: preferredDisplayName } : {}),
-                        },
-                        $inc: { unreadCount: 1 },
-                        $setOnInsert: { companyId, waId: from },
-                    }, { upsert: true });
-                    io?.to(companyRoom).emit("message:new", {
-                        waId: from,
-                        message: {
-                            wamid: m.id,
-                            direction: "in",
-                            type: m.type ?? "unknown",
-                            bodyText,
-                            preview,
-                            timestamp: timestamp.toISOString(),
-                        },
-                    });
-                    io?.to(companyRoom).emit("chat:updated", {
-                        waId: from,
-                        displayName: preferredDisplayName,
-                        lastMessagePreview: preview,
-                        lastMessageAt: timestamp.toISOString(),
-                        unreadCountDelta: 1,
-                    });
-                    if (takeLiveTestIfActive(String(companyId))) {
-                        const now = new Date();
-                        await CompanyWebhookVerifyToken.updateOne({ companyId }, { $set: { liveTestPassedAt: now } });
-                        io?.to(companyRoom).emit("webhook:live-test:success", {
-                            ok: true,
-                            message: "Tu conexión al webhook de Meta se estableció correctamente.",
-                            passedAt: now.toISOString(),
-                        });
-                    }
                 }
             }
             if (hasStatuses && statuses) {

@@ -5,22 +5,22 @@ declare const templateSampleUploadSchema: mongoose.Schema<any, mongoose.Model<an
 }, {
     companyId: mongoose.Types.ObjectId;
     data: Buffer<ArrayBufferLike>;
-    token: string;
     mimeType: string;
+    token: string;
     originalName?: string | null | undefined;
 } & mongoose.DefaultTimestampProps, mongoose.Document<unknown, {}, mongoose.FlatRecord<{
     companyId: mongoose.Types.ObjectId;
     data: Buffer<ArrayBufferLike>;
-    token: string;
     mimeType: string;
+    token: string;
     originalName?: string | null | undefined;
 } & mongoose.DefaultTimestampProps>, {}, mongoose.MergeType<mongoose.DefaultSchemaOptions, {
     timestamps: true;
 }>> & mongoose.FlatRecord<{
     companyId: mongoose.Types.ObjectId;
     data: Buffer<ArrayBufferLike>;
-    token: string;
     mimeType: string;
+    token: string;
     originalName?: string | null | undefined;
 } & mongoose.DefaultTimestampProps> & {
     _id: mongoose.Types.ObjectId;

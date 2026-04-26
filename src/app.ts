@@ -1,6 +1,7 @@
 import cors from "cors";
 import type { Express } from "express";
 import express from "express";
+import type { Server } from "socket.io";
 import { createInboxRouter } from "./routes/inboxApi.js";
 import { createSendApiRouter } from "./routes/sendApi.js";
 import { createWebhookRouter } from "./webhookRouter.js";
@@ -14,9 +15,12 @@ export type CreateAppOptions = {
   serwpSendUrl: string;
   masssivoQrWaBaseUrl?: string;
   masssivoQrWaKey?: string;
+  qrInboxServiceUrl?: string;
+  qrInboxServiceKey?: string;
   mediaServiceUrl?: string;
   mediaServiceKey?: string;
   mediaPublicBaseUrl?: string;
+  getIo?: () => Server | undefined;
 };
 
 export function createApp(opts: CreateAppOptions): Express {
@@ -40,9 +44,12 @@ export function createApp(opts: CreateAppOptions): Express {
       serwpSendUrl: opts.serwpSendUrl,
       masssivoQrWaBaseUrl: opts.masssivoQrWaBaseUrl,
       masssivoQrWaKey: opts.masssivoQrWaKey,
+      qrInboxServiceUrl: opts.qrInboxServiceUrl,
+      qrInboxServiceKey: opts.qrInboxServiceKey,
       mediaServiceUrl: opts.mediaServiceUrl,
       mediaServiceKey: opts.mediaServiceKey,
       mediaPublicBaseUrl: opts.mediaPublicBaseUrl,
+      getIo: opts.getIo,
     }),
   );
 

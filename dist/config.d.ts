@@ -9,8 +9,10 @@ export declare const config: {
     webhookVerifyToken: string | undefined;
     port: number;
     /** Base de datos del dashboard / inbox */
-    /** Por defecto misma BD que serWP (`serwp`) si no defines MONGODB_URI. */
+    /** BD principal WAPI (Masssivo). */
     mongodbUri: string;
+    /** BD inbox QR (mismo host/credenciales que MONGODB_URI si se deriva). */
+    mongodbQrInboxUri: string;
     /** Auth / portal send */
     sendJwtSecret: string;
     serwpSendUrl: string;
@@ -19,6 +21,9 @@ export declare const config: {
     /** Microservicio masssivo-qr-wa (Baileys, solo localhost; el proxy añade JWT → companyId). */
     masssivoQrWaUrl: string;
     masssivoQrWaKey: string | undefined;
+    /** Servicio separado de persistencia QR Inbox */
+    qrInboxServiceUrl: string;
+    qrInboxServiceKey: string | undefined;
     /** masssivo-media (MinIO). Si faltan, las plantillas QR con imagen solo aceptan URL pública (legacy). */
     mediaServiceUrl: string;
     mediaServiceKey: string | undefined;

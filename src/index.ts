@@ -5,6 +5,7 @@ import mongoose from "mongoose";
 import { Server } from "socket.io";
 import { createApp } from "./app.js";
 import { config } from "./config.js";
+import { initQrInboxStore } from "./models/qrInboxStore.js";
 import { attachQrWaWebSocketProxy } from "./qrWaWsProxy.js";
 import { CompanyWebhookVerifyToken } from "./models/CompanyWebhookVerifyToken.js";
 import { ingestWhatsAppWebhook } from "./services/webhookIngest.js";
@@ -36,9 +37,12 @@ const app = createApp({
   serwpSendUrl: config.serwpSendUrl,
   masssivoQrWaBaseUrl: config.masssivoQrWaUrl,
   masssivoQrWaKey: config.masssivoQrWaKey,
+  qrInboxServiceUrl: config.qrInboxServiceUrl,
+  qrInboxServiceKey: config.qrInboxServiceKey,
   mediaServiceUrl: config.mediaServiceUrl,
   mediaServiceKey: config.mediaServiceKey,
   mediaPublicBaseUrl: config.mediaPublicBaseUrl,
+  getIo: () => io,
   onWebhook: (body) => {
     void ingestWhatsAppWebhook(body, io).catch((e) => console.error("[webhook ingest]", e));
   },
@@ -84,6 +88,8 @@ process.on("uncaughtException", (err) => {
 async function main(): Promise<void> {
   await mongoose.connect(config.mongodbUri);
   console.log("[mongo] conectado:", config.mongodbUri);
+  await initQrInboxStore(config.mongodbQrInboxUri);
+  console.log("[mongo] inbox QR separado:", config.mongodbQrInboxUri);
   httpServer.listen(config.port, "0.0.0.0", () => {
     console.log(`Servidor en http://0.0.0.0:${config.port}`);
     console.log(`Webhook: /webhook | Inbox API: /inbox/v1 | Socket.io: /inbox/socket.io/`);
